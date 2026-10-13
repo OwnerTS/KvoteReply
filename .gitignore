@@ -1,0 +1,17 @@
+# Zig build artifacts
+.zig-cache/
+zig-out/
+
+# Binaries
+*.dll
+*.so
+*.dylib
+*.lib
+*.pdb
+*.exp
+*.o
+*.obj
+
+# OS files
+.DS_Store
+Thumbs.db

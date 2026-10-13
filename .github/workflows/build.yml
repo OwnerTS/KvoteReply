@@ -1,0 +1,44 @@
+name: Build KvoteReply Plugin
+
+on:
+  push:
+    branches: [ main, dev ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-x64
+            target: x86_64-windows-gnu
+            artifact_name: KvoteReply-windows-x64
+            artifact_pattern: "zig-out/bin/*.dll"
+          - name: linux-x64
+            target: x86_64-linux-gnu
+            artifact_name: KvoteReply-linux-x64
+            artifact_pattern: "zig-out/lib/*.so"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v1
+        with:
+          version: 0.15.2
+
+      - name: Build Plugin
+        run: zig build -Doptimize=ReleaseFast -Dtarget=${{ matrix.target }}
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.artifact_pattern }}
+          if-no-files-found: error
