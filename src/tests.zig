@@ -46,3 +46,37 @@ test "plugin metadata" {
     try testing.expectEqualStrings("1.0.0", std.mem.span(meta.?.version));
     try testing.expectEqualStrings("OwnerTS", std.mem.span(meta.?.author));
 }
+
+test "cleanupCacheDir rotates old quote files" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    var tmp_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_path = try tmp.dir.realpath(".", &tmp_path_buf);
+
+    // Create 5 quote files
+    const names = [_][]const u8{
+        "quote_reply_1.png",
+        "quote_reply_2.png",
+        "quote_reply_3.png",
+        "quote_reply_4.png",
+        "quote_reply_5.png",
+    };
+    for (names) |name| {
+        const f = try tmp.dir.createFile(name, .{});
+        f.close();
+    }
+
+    // Cleanup down to 3 files
+    plugin.cleanupCacheDir(tmp_path, 3);
+
+    // Count remaining
+    var count: usize = 0;
+    var iter = tmp.dir.iterate();
+    while (try iter.next()) |entry| {
+        if (entry.kind == .file and std.mem.startsWith(u8, entry.name, "quote_reply_")) {
+            count += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, 3), count);
+}

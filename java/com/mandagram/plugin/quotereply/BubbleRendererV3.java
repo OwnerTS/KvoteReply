@@ -6,16 +6,10 @@ import androidx.compose.runtime.Composer;
 import com.mandagram.models.MessageItem;
 import com.mandagram.ui.chat.MessageBubbleKt;
 import com.mandagram.ui.theme.ThemeKt;
-import com.mandagram.utils.AppPaths;
 import kotlin.Unit;
 import kotlin.jvm.functions.Function2;
 import kotlin.coroutines.EmptyCoroutineContext;
 import org.jetbrains.skia.*;
-import java.io.File;
-import java.io.FileOutputStream;
-import java.nio.charset.StandardCharsets;
-import java.util.Arrays;
-import java.util.Comparator;
 
 public class BubbleRendererV3 implements Function2<Composer, Integer, Unit> {
 
@@ -45,26 +39,7 @@ public class BubbleRendererV3 implements Function2<Composer, Integer, Unit> {
         return Unit.INSTANCE;
     }
 
-    public static int getChatBackgroundColor() {
-        try {
-            if (com.mandagram.ui.theme.ThemeManager.INSTANCE.isDark()) {
-                java.lang.reflect.Method mSeed = com.mandagram.ui.theme.ThemeManager.class.getMethod("getSeedColor-0d7_KjU");
-                long seed = ((Long) mSeed.invoke(com.mandagram.ui.theme.ThemeManager.INSTANCE)).longValue();
-                java.lang.reflect.Method mColor = com.mandagram.ui.theme.MonetSeed.class.getMethod("getColor-0d7_KjU");
-                long pistachioColor = ((Long) mColor.invoke(com.mandagram.ui.theme.MonetSeed.PISTACHIO)).longValue();
-                if (seed == pistachioColor) {
-                    return 0xFF0F110D;
-                }
-                return 0xFF100D0B;
-            } else {
-                return 0xFFFDF8F6;
-            }
-        } catch (Throwable t) {
-            return 0xFF100D0B;
-        }
-    }
-
-    public static byte[] renderMessageToPng(MessageItem msg) {
+    public static byte[] renderMessageToPng(MessageItem msg, int chatBg) {
         if (msg == null) return null;
         synchronized (INSTANCE) {
             INSTANCE.currentMsg = msg;
@@ -81,10 +56,7 @@ public class BubbleRendererV3 implements Function2<Composer, Integer, Unit> {
             );
             try {
                 Image fullImg = scene.render(0L);
-                if (fullImg == null) {
-                    logJavaError("scene.render(0L) returned null", null);
-                    return null;
-                }
+                if (fullImg == null) return null;
 
                 Bitmap bmp = Bitmap.Companion.makeFromImage(fullImg);
                 if (bmp == null) {
@@ -162,8 +134,6 @@ public class BubbleRendererV3 implements Function2<Composer, Integer, Unit> {
                     }
                 }
 
-                int chatBg = getChatBackgroundColor();
-
                 if (minX <= maxX && minY <= maxY) {
                     int pad = 6;
                     minX = Math.max(0, minX - pad);
@@ -201,82 +171,10 @@ public class BubbleRendererV3 implements Function2<Composer, Integer, Unit> {
 
                 Data data = fullImg.encodeToData(EncodedImageFormat.PNG, 100);
                 return data != null ? data.getBytes() : null;
-            } catch (Throwable t) {
-                logJavaError("renderMessageToPng error", t);
-                return null;
             } finally {
                 scene.close();
                 INSTANCE.currentMsg = null;
             }
         }
-    }
-
-    public static String renderMessageToFile(MessageItem msg, String preferredPath) {
-        try {
-            byte[] bytes = renderMessageToPng(msg);
-            if (bytes == null || bytes.length == 0) {
-                logJavaError("renderMessageToPng produced null or empty bytes", null);
-                return null;
-            }
-
-            File targetFile;
-            if (preferredPath != null && !preferredPath.isEmpty()) {
-                targetFile = new File(preferredPath);
-                File parent = targetFile.getParentFile();
-                if (parent != null) parent.mkdirs();
-            } else {
-                File cacheDir = new File(AppPaths.INSTANCE.getDataDir(), "cache/quote_replies");
-                cacheDir.mkdirs();
-                cleanupCacheDir(cacheDir, 8);
-                targetFile = new File(cacheDir, "quote_reply_" + System.currentTimeMillis() + ".png");
-            }
-
-            FileOutputStream fos = new FileOutputStream(targetFile);
-            fos.write(bytes);
-            fos.flush();
-            fos.close();
-            return targetFile.getAbsolutePath();
-        } catch (Throwable t) {
-            logJavaError("renderMessageToFile error", t);
-            return null;
-        }
-    }
-
-    private static void cleanupCacheDir(File dir, int maxFiles) {
-        try {
-            File[] files = dir.listFiles((d, name) -> name.startsWith("quote_reply_") && name.endsWith(".png"));
-            if (files != null && files.length > maxFiles) {
-                Arrays.sort(files, Comparator.comparingLong(File::lastModified));
-                int toDelete = files.length - maxFiles;
-                for (int i = 0; i < toDelete; i++) {
-                    files[i].delete();
-                }
-            }
-        } catch (Throwable ignored) {}
-    }
-
-    private static void logJavaError(String header, Throwable t) {
-        try {
-            File logFile = new File(AppPaths.INSTANCE.getDataDir(), "mandagram.log");
-            FileOutputStream fos = new FileOutputStream(logFile, true);
-            StringBuilder sb = new StringBuilder();
-            sb.append("[KvoteReply-Java] ").append(header);
-            if (t != null) {
-                sb.append(": ").append(t.toString()).append("\n");
-                for (StackTraceElement ste : t.getStackTrace()) {
-                    sb.append("    at ").append(ste.toString()).append("\n");
-                }
-                if (t.getCause() != null) {
-                    sb.append("Caused by: ").append(t.getCause().toString()).append("\n");
-                    for (StackTraceElement ste : t.getCause().getStackTrace()) {
-                        sb.append("    at ").append(ste.toString()).append("\n");
-                    }
-                }
-            } else {
-                sb.append("\n");
-            }
-            fos.write(sb.toString().getBytes(StandardCharsets.UTF_8));
-            fos.close();
-        } catch (Throwable ignored) {}
     }
 }

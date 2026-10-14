@@ -219,6 +219,40 @@ pub const JNINativeInterface = extern struct {
     NewObjectArray: ?*const fn (env: *JNIEnv, len: jsize, clazz: jclass, init: jobject) callconv(.c) jobjectArray,
     GetObjectArrayElement: ?*const fn (env: *JNIEnv, array: jobjectArray, index: jsize) callconv(.c) jobject,
     SetObjectArrayElement: ?*const fn (env: *JNIEnv, array: jobjectArray, index: jsize, val: jobject) callconv(.c) void,
+
+    // New<Type>Array
+    NewBooleanArray: ?*anyopaque = null,
+    NewByteArray: ?*const fn (env: *JNIEnv, len: jsize) callconv(.c) jobject = null,
+    NewCharArray: ?*anyopaque = null,
+    NewShortArray: ?*anyopaque = null,
+    NewIntArray: ?*anyopaque = null,
+    NewLongArray: ?*anyopaque = null,
+    NewFloatArray: ?*anyopaque = null,
+    NewDoubleArray: ?*anyopaque = null,
+
+    // Get<Type>ArrayElements
+    GetBooleanArrayElements: ?*anyopaque = null,
+    GetByteArrayElements: ?*const fn (env: *JNIEnv, array: jobject, isCopy: ?*jboolean) callconv(.c) ?[*]jbyte = null,
+    GetCharArrayElements: ?*anyopaque = null,
+    GetShortArrayElements: ?*anyopaque = null,
+    GetIntArrayElements: ?*anyopaque = null,
+    GetLongArrayElements: ?*anyopaque = null,
+    GetFloatArrayElements: ?*anyopaque = null,
+    GetDoubleArrayElements: ?*anyopaque = null,
+
+    // Release<Type>ArrayElements
+    ReleaseBooleanArrayElements: ?*anyopaque = null,
+    ReleaseByteArrayElements: ?*const fn (env: *JNIEnv, array: jobject, elems: [*]const jbyte, mode: jint) callconv(.c) void = null,
+    ReleaseCharArrayElements: ?*anyopaque = null,
+    ReleaseShortArrayElements: ?*anyopaque = null,
+    ReleaseIntArrayElements: ?*anyopaque = null,
+    ReleaseLongArrayElements: ?*anyopaque = null,
+    ReleaseFloatArrayElements: ?*anyopaque = null,
+    ReleaseDoubleArrayElements: ?*anyopaque = null,
+
+    // Get<Type>ArrayRegion
+    GetBooleanArrayRegion: ?*anyopaque = null,
+    GetByteArrayRegion: ?*const fn (env: *JNIEnv, array: jobject, start: jsize, len: jsize, buf: [*]jbyte) callconv(.c) void = null,
 };
 
 pub const JNIEnv = *const JNINativeInterface;

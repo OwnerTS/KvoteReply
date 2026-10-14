@@ -462,8 +462,167 @@ fn ensureBubbleRendererLoaded(env: *JNIEnv, opt_loader: ?jobject) ?jclass {
     return bubble_renderer_class;
 }
 
+pub fn getChatBackgroundColor(env: *JNIEnv) i32 {
+    const theme_mgr_cls = JniAccessor.findClass(env, "com/mandagram/ui/theme/ThemeManager") orelse return @bitCast(@as(u32, 0xFF100D0B));
+    defer if (env.*.DeleteLocalRef) |del| del(env, theme_mgr_cls);
+
+    const inst_fid = env.*.GetStaticFieldID.?(
+        env,
+        theme_mgr_cls,
+        "INSTANCE",
+        "Lcom/mandagram/ui/theme/ThemeManager;",
+    ) orelse {
+        checkClearException(env);
+        return @bitCast(@as(u32, 0xFF100D0B));
+    };
+
+    const inst = env.*.GetStaticObjectField.?(env, theme_mgr_cls, inst_fid);
+    if (inst == null) {
+        checkClearException(env);
+        return @bitCast(@as(u32, 0xFF100D0B));
+    }
+    defer if (env.*.DeleteLocalRef) |del| del(env, inst.?);
+
+    const is_dark_mid = env.*.GetMethodID.?(
+        env,
+        theme_mgr_cls,
+        "isDark",
+        "()Z",
+    ) orelse {
+        checkClearException(env);
+        return @bitCast(@as(u32, 0xFF100D0B));
+    };
+
+    const is_dark = env.*.CallBooleanMethod.?(env, inst.?, is_dark_mid) != 0;
+    checkClearException(env);
+
+    if (!is_dark) {
+        return @bitCast(@as(u32, 0xFFFDF8F6));
+    }
+
+    const seed_mid = env.*.GetMethodID.?(env, theme_mgr_cls, "getSeedColor-0d7_KjU", "()J");
+    if (seed_mid) |smid| {
+        const seed = env.*.CallLongMethod.?(env, inst.?, smid);
+        checkClearException(env);
+        const monet_cls = JniAccessor.findClass(env, "com/mandagram/ui/theme/MonetSeed");
+        if (monet_cls) |mcls| {
+            defer if (env.*.DeleteLocalRef) |del| del(env, mcls);
+            const pist_fid = env.*.GetStaticFieldID.?(env, mcls, "PISTACHIO", "Lcom/mandagram/ui/theme/MonetSeed;");
+            if (pist_fid) |pfid| {
+                const pist = env.*.GetStaticObjectField.?(env, mcls, pfid);
+                if (pist) |pobj| {
+                    defer if (env.*.DeleteLocalRef) |del| del(env, pobj);
+                    const color_mid = env.*.GetMethodID.?(env, mcls, "getColor-0d7_KjU", "()J");
+                    if (color_mid) |cmid| {
+                        const pist_color = env.*.CallLongMethod.?(env, pobj, cmid);
+                        checkClearException(env);
+                        if (seed == pist_color) {
+                            return @bitCast(@as(u32, 0xFF0F110D));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    checkClearException(env);
+    return @bitCast(@as(u32, 0xFF100D0B));
+}
+
+pub const CacheFileEntry = struct {
+    name: [128]u8,
+    name_len: usize,
+    mtime: i128,
+};
+
+pub fn cleanupCacheDir(dir_path: []const u8, max_files: usize) void {
+    var dir = std.fs.openDirAbsolute(dir_path, .{ .iterate = true }) catch return;
+    defer dir.close();
+
+    var entries_buf: [64]CacheFileEntry = undefined;
+    var count: usize = 0;
+
+    var iter = dir.iterate();
+    while (iter.next() catch null) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.startsWith(u8, entry.name, "quote_reply_") or !std.mem.endsWith(u8, entry.name, ".png")) continue;
+
+        const stat = dir.statFile(entry.name) catch continue;
+        if (count < entries_buf.len) {
+            const copy_len = @min(entry.name.len, entries_buf[count].name.len);
+            @memcpy(entries_buf[count].name[0..copy_len], entry.name[0..copy_len]);
+            entries_buf[count].name_len = copy_len;
+            entries_buf[count].mtime = stat.mtime;
+            count += 1;
+        }
+    }
+
+    if (count > max_files) {
+        const slice = entries_buf[0..count];
+        std.mem.sort(CacheFileEntry, slice, {}, struct {
+            fn lessThan(_: void, a: CacheFileEntry, b: CacheFileEntry) bool {
+                return a.mtime < b.mtime;
+            }
+        }.lessThan);
+
+        const to_delete = count - max_files;
+        for (slice[0..to_delete]) |item| {
+            dir.deleteFile(item.name[0..item.name_len]) catch {};
+        }
+    }
+}
+
+pub fn getQuotesCacheDir(api: *const PluginApi, out_buf: []u8) ?[]const u8 {
+    var cache_buf: [512]u8 = undefined;
+    if (api.get_cache_dir) |get_dir| {
+        const len = get_dir("KvoteReply", &cache_buf, cache_buf.len);
+        if (len > 0) {
+            const base = cache_buf[0..@intCast(len)];
+            const formatted = std.fmt.bufPrint(out_buf, "{s}/quote_replies", .{base}) catch return null;
+            std.fs.makeDirAbsolute(formatted) catch |err| switch (err) {
+                error.PathAlreadyExists => {},
+                else => return null,
+            };
+            return formatted;
+        }
+    }
+    const fallback = std.fmt.bufPrint(out_buf, "data/cache/quote_replies", .{}) catch return null;
+    std.fs.cwd().makePath(fallback) catch {};
+    return fallback;
+}
+
+pub fn savePngBytesToFile(
+    api: *const PluginApi,
+    bytes: []const u8,
+    out_path_buf: []u8,
+) ?[:0]const u8 {
+    var dir_buf: [512]u8 = undefined;
+    const cache_dir = getQuotesCacheDir(api, &dir_buf) orelse return null;
+
+    cleanupCacheDir(cache_dir, 8);
+
+    const ts = std.time.milliTimestamp();
+    const full_path = std.fmt.bufPrint(
+        out_path_buf,
+        "{s}/quote_reply_{d}.png",
+        .{ cache_dir, ts },
+    ) catch return null;
+
+    const file = std.fs.createFileAbsolute(full_path, .{}) catch return null;
+    defer file.close();
+
+    file.writeAll(bytes) catch return null;
+
+    if (full_path.len < out_path_buf.len) {
+        out_path_buf[full_path.len] = 0;
+        return out_path_buf[0..full_path.len :0];
+    }
+    return null;
+}
+
 fn renderMessageItemToFile(env: *JNIEnv, msg_item: jobject, out_path_buf: []u8) ?[:0]const u8 {
+    const api = global_api orelse return null;
     if (msg_item == null) return null;
+
     const loader = getClassLoaderFromObject(env, msg_item);
     defer if (loader != null) {
         if (env.*.DeleteLocalRef) |del| del(env, loader.?);
@@ -477,29 +636,50 @@ fn renderMessageItemToFile(env: *JNIEnv, msg_item: jobject, out_path_buf: []u8) 
     const mid = env.*.GetStaticMethodID.?(
         env,
         renderer_cls,
-        "renderMessageToFile",
-        "(Lcom/mandagram/models/MessageItem;Ljava/lang/String;)Ljava/lang/String;",
+        "renderMessageToPng",
+        "(Lcom/mandagram/models/MessageItem;I)[B",
     ) orelse {
-        logErrFmt("[renderMessageItemToFile] GetStaticMethodID renderMessageToFile failed", .{});
+        logErrFmt("[renderMessageItemToFile] GetStaticMethodID renderMessageToPng failed", .{});
         checkClearException(env);
         return null;
     };
 
-    const j_res = env.*.CallStaticObjectMethod.?(env, renderer_cls, mid, msg_item, @as(jobject, null));
+    const chat_bg = getChatBackgroundColor(env);
+    const j_res = env.*.CallStaticObjectMethod.?(env, renderer_cls, mid, msg_item, chat_bg);
     if (j_res == null) {
-        logErrFmt("[renderMessageItemToFile] renderMessageToFile returned null", .{});
+        logErrFmt("[renderMessageItemToFile] renderMessageToPng returned null", .{});
         checkClearException(env);
         return null;
     }
+    defer if (env.*.DeleteLocalRef) |del| del(env, j_res);
 
-    if (JniAccessor.getStringUtfChars(env, j_res)) |chars| {
-        defer JniAccessor.releaseStringUtfChars(env, j_res, chars);
-        const slice = std.mem.span(chars);
-        const copy_len = @min(slice.len, out_path_buf.len - 1);
-        @memcpy(out_path_buf[0..copy_len], slice[0..copy_len]);
-        out_path_buf[copy_len] = 0;
-        return out_path_buf[0..copy_len :0];
+    const jbarr = j_res;
+    const len = env.*.GetArrayLength.?(env, jbarr);
+    if (len <= 0) {
+        logErrFmt("[renderMessageItemToFile] renderMessageToPng returned empty byte array", .{});
+        return null;
     }
+
+    const ulen: usize = @intCast(len);
+    if (env.*.GetByteArrayRegion) |getRegion| {
+        var stack_buf: [65536]i8 = undefined;
+        if (ulen <= stack_buf.len) {
+            getRegion(env, jbarr, 0, len, &stack_buf);
+            const raw_ptr: [*]const u8 = @ptrCast(&stack_buf);
+            return savePngBytesToFile(api, raw_ptr[0..ulen], out_path_buf);
+        }
+    }
+
+    if (env.*.GetByteArrayElements) |getElements| {
+        const elements = getElements(env, jbarr, null);
+        if (elements != null) {
+            defer if (env.*.ReleaseByteArrayElements) |rel| rel(env, jbarr, elements.?, 0);
+            const raw_ptr: [*]const u8 = @ptrCast(elements.?);
+            return savePngBytesToFile(api, raw_ptr[0..ulen], out_path_buf);
+        }
+    }
+
+    logErrFmt("[renderMessageItemToFile] Failed to read jbyteArray", .{});
     return null;
 }
 
