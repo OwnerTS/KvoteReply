@@ -43,7 +43,7 @@ test "plugin metadata" {
     const meta = plugin.mandagram_plugin_metadata();
     try testing.expect(meta != null);
     try testing.expectEqualStrings("KvoteReply", std.mem.span(meta.?.name));
-    try testing.expectEqualStrings("1.0.0", std.mem.span(meta.?.version));
+    try testing.expectEqualStrings("2.0.0", std.mem.span(meta.?.version));
     try testing.expectEqualStrings("OwnerTS", std.mem.span(meta.?.author));
 }
 

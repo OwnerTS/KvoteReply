@@ -253,9 +253,63 @@ pub const JNINativeInterface = extern struct {
     // Get<Type>ArrayRegion
     GetBooleanArrayRegion: ?*anyopaque = null,
     GetByteArrayRegion: ?*const fn (env: *JNIEnv, array: jobject, start: jsize, len: jsize, buf: [*]jbyte) callconv(.c) void = null,
+    GetCharArrayRegion: ?*anyopaque = null,
+    GetShortArrayRegion: ?*anyopaque = null,
+    GetIntArrayRegion: ?*anyopaque = null,
+    GetLongArrayRegion: ?*anyopaque = null,
+    GetFloatArrayRegion: ?*anyopaque = null,
+    GetDoubleArrayRegion: ?*anyopaque = null,
+
+    // Set<Type>ArrayRegion
+    SetBooleanArrayRegion: ?*anyopaque = null,
+    SetByteArrayRegion: ?*anyopaque = null,
+    SetCharArrayRegion: ?*anyopaque = null,
+    SetShortArrayRegion: ?*anyopaque = null,
+    SetIntArrayRegion: ?*anyopaque = null,
+    SetLongArrayRegion: ?*anyopaque = null,
+    SetFloatArrayRegion: ?*anyopaque = null,
+    SetDoubleArrayRegion: ?*anyopaque = null,
+
+    // Register / Monitors
+    RegisterNatives: ?*anyopaque = null,
+    UnregisterNatives: ?*anyopaque = null,
+    MonitorEnter: ?*anyopaque = null,
+    MonitorExit: ?*anyopaque = null,
+
+    // GetJavaVM
+    GetJavaVM: ?*const fn (env: *JNIEnv, vm: *?*JavaVM) callconv(.c) jint = null,
 };
 
+pub const JNI_VERSION_1_1: jint = 0x00010001;
+pub const JNI_VERSION_1_2: jint = 0x00010002;
+pub const JNI_VERSION_1_4: jint = 0x00010004;
+pub const JNI_VERSION_1_6: jint = 0x00010006;
+pub const JNI_VERSION_1_8: jint = 0x00010008;
+
 pub const JNIEnv = *const JNINativeInterface;
+
+pub const JavaVM = extern struct {
+    functions: *const JNIInvokeInterface,
+
+    pub inline fn getEnv(self: *JavaVM, penv: *?*anyopaque, version: jint) jint {
+        if (self.functions.GetEnv) |f| {
+            return f(self, penv, version);
+        }
+        return -1;
+    }
+};
+
+pub const JNIInvokeInterface = extern struct {
+    reserved0: ?*anyopaque = null,
+    reserved1: ?*anyopaque = null,
+    reserved2: ?*anyopaque = null,
+
+    DestroyJavaVM: ?*anyopaque = null,
+    AttachCurrentThread: ?*anyopaque = null,
+    DetachCurrentThread: ?*anyopaque = null,
+    GetEnv: ?*const fn (vm: *JavaVM, penv: *?*anyopaque, version: jint) callconv(.c) jint = null,
+    AttachCurrentThreadAsDaemon: ?*anyopaque = null,
+};
 
 pub const HookParam = extern struct {
     env: ?*anyopaque,

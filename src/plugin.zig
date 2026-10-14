@@ -1,10 +1,30 @@
+//! ============================================================================
+//! KvoteReply v2.0.0 — Pure Zig Compose Quote Renderer Plugin for MandaGram
+//!
+//! Данный плагин перехватывает исходящие ответы на сообщения в Telegram и
+//! превращает их в фото-цитаты с аутентичным внешним видом Compose Desktop:
+//! - Настоящий MessageBubble из MandaGram (тот же шрифт Google Sans, Apple эмодзи,
+//!   скругления пузыря, аватарка, имя автора, галочки статуса).
+//! - 100% Native Pure Zig архитектура без внешних Java-файлов, без .class байткода
+//!   и без вызова небезопасного JNI DefineClass.
+//! - Headless Offscreen рендеринг через Jetpack Compose Desktop (ImageComposeScene)
+//!   и Skia (org.jetbrains.skia).
+//! - Прямое сканирование нативной памяти пикселей (Skia Pixmap) для точного
+//!   вычисления границ пузыря (bounding box) и обрезки без полей.
+//! - Автоматическая адаптация цвета фона под текущую тему оформления MandaGram
+//!   (светлая / тёмная / Monet Pistachio).
+//! ============================================================================
+
 const std = @import("std");
 const plugin_api = @import("include/mandagram_plugin.zig");
 const accessor = @import("include/jni_accessor.zig");
+
+// Импорт базовых типов JNI и Plugin API
 const HookParam = plugin_api.HookParam;
 const PluginApi = plugin_api.PluginApi;
 const JniAccessor = accessor.JniAccessor;
 const JNIEnv = plugin_api.JNIEnv;
+const JavaVM = plugin_api.JavaVM;
 const jobject = plugin_api.jobject;
 const jclass = plugin_api.jclass;
 const jvalue = plugin_api.jvalue;
@@ -13,42 +33,68 @@ const jlong = plugin_api.jlong;
 const jboolean = plugin_api.jboolean;
 const jfloat = plugin_api.jfloat;
 
+// -----------------------------------------------------------------------------
+// Глобальное состояние плагина
+// -----------------------------------------------------------------------------
+
+/// Указатель на интерфейс ядра MandaGram Plugin API (логирование, пути к кэшу, хуки)
 var global_api: ?*const PluginApi = null;
+
+/// Кэшированный указатель на виртуальную машину Java (JavaVM).
+/// Сохраняется при первом вызове любого JNI-хука. Необходим для того, чтобы в функции
+/// mandagram_plugin_unload() (где JNIEnv не передаётся напрямую) получить JNIEnv
+/// текущего потока и безопасно удалить глобальные ссылки (DeleteGlobalRef).
+var global_jvm: ?*JavaVM = null;
+
+/// Атомарный флаг активности плагина.
+/// Позволяет мгновенно отключить всю логику плагина при выгрузке без race conditions.
 var is_active = std.atomic.Value(bool).init(true);
+
+/// Пользовательская настройка: отключать ли авто-фотоцитаты в топиках форумов и обсуждениях
 var disable_in_discussions: bool = false;
 
+/// Метаданные плагина, экспортируемые ядру MandaGram
 pub const METADATA = plugin_api.PluginMetadata{
     .name = "KvoteReply",
-    .version = "1.0.0",
+    .version = "2.0.0",
     .author = "OwnerTS",
-    .description = "Pixel-perfect authentic Compose message bubble photo quote replies for MandaGram.",
+    .description = "Pixel-perfect authentic Compose message bubble photo quote replies for MandaGram (Pure Zig, Headless Skia).",
 };
 
+/// Точка входа для получения метаданных плагина загрузчиком MandaGram
 pub export fn mandagram_plugin_metadata() callconv(.c) ?*const plugin_api.PluginMetadata {
     return &METADATA;
 }
 
+/// Состояние подготавливаемой цитаты.
+/// Хранит данные между хуком клика "Ответить" и фактической отправкой сообщения.
 const PendingQuoteState = struct {
+    /// ID целевого сообщения в Telegram (TDLib messageId)
     msg_id: i64 = 0,
-    sender_id: i64 = 0,
-    author_buf: [256]u8 = [_]u8{0} ** 256,
-    author_len: usize = 0,
+    /// Буфер для текста цитируемого сообщения (используется для формирования TDLib InputTextQuote)
     text_buf: [4096]u8 = [_]u8{0} ** 4096,
     text_len: usize = 0,
-    time_buf: [32]u8 = [_]u8{0} ** 32,
-    time_len: usize = 0,
-    avatar_buf: [512]u8 = [_]u8{0} ** 512,
-    avatar_len: usize = 0,
-    initials_buf: [16]u8 = [_]u8{0} ** 16,
-    initials_len: usize = 0,
+    /// Абсолютный путь к предварительно сгенерированному PNG-файлу с изображением пузыря
     captured_path_buf: [512]u8 = [_]u8{0} ** 512,
     captured_path_len: usize = 0,
 };
 
+/// Мьютекс для защиты конкурентного доступа к состоянию ответа.
+/// События интерфейса (AWT-EventQueue) и сетевые колбэки (TDLib) могут вызываться в разных потоках.
 var quote_mutex = std.Thread.Mutex{};
+
+/// Активное состояние ответа
 var pending_quote = PendingQuoteState{};
+
+/// Кэшированная глобальная JNI-ссылка на объект MessageItem.
+/// Защищает Kotlin-объект сообщения от сбора мусора (GC) между этапом клика и отправкой.
 var cached_message_item: ?jobject = null;
 
+// -----------------------------------------------------------------------------
+// Вспомогательные функции логирования и проверки исключений JNI
+// -----------------------------------------------------------------------------
+
+/// Форматированный вывод информационного лога в консоль MandaGram
 fn logFmt(comptime fmt: []const u8, args: anytype) void {
     const api = global_api orelse return;
     var buf: [512]u8 = undefined;
@@ -56,6 +102,7 @@ fn logFmt(comptime fmt: []const u8, args: anytype) void {
     api.log_info("KvoteReply", msg);
 }
 
+/// Форматированный вывод лога ошибки в консоль MandaGram
 fn logErrFmt(comptime fmt: []const u8, args: anytype) void {
     const api = global_api orelse return;
     var buf: [512]u8 = undefined;
@@ -63,6 +110,9 @@ fn logErrFmt(comptime fmt: []const u8, args: anytype) void {
     api.log_error("KvoteReply", msg);
 }
 
+/// Проверяет, возникло ли в JVM исключение (exception).
+/// Если возникло — печатает stack trace в консоль и очищает флаг исключения (ExceptionClear),
+/// чтобы последующие JNI-вызовы в этом потоке не падали аварийно.
 pub fn checkClearException(env: *JNIEnv) void {
     if (env.*.ExceptionOccurred) |occ| {
         if (occ(env)) |ex| {
@@ -84,6 +134,18 @@ pub fn checkClearException(env: *JNIEnv) void {
     }
 }
 
+/// Кэширует JavaVM из переданного окружения JNIEnv, если она ещё не была сохранена.
+/// Позволяет в любой момент (включая mandagram_plugin_unload) восстановить JNIEnv.
+fn ensureJvmCached(env: *JNIEnv) void {
+    if (global_jvm == null) {
+        if (env.*.GetJavaVM) |get_vm| {
+            _ = get_vm(env, &global_jvm);
+        }
+    }
+}
+
+/// Безопасно обрезает строку UTF-8 по границе кодовых точек (символов),
+/// чтобы не расщепить многобайтовый UTF-8 символ или эмодзи.
 pub fn utf8Truncate(text: []const u8, max_bytes: usize) []const u8 {
     if (text.len <= max_bytes) return text;
     var len = max_bytes;
@@ -94,9 +156,10 @@ pub fn utf8Truncate(text: []const u8, max_bytes: usize) []const u8 {
 }
 
 // -----------------------------------------------------------------------------
-// Settings Persistence
+// Сохранение и загрузка настроек плагина
 // -----------------------------------------------------------------------------
 
+/// Загружает настройки плагина из файла <storage_dir>/settings.txt
 fn loadSettings(api: *const PluginApi) void {
     var dir_buf: [512]u8 = undefined;
     if (api.get_storage_dir) |get_dir| {
@@ -116,6 +179,7 @@ fn loadSettings(api: *const PluginApi) void {
     }
 }
 
+/// Сохраняет настройки плагина в файл <storage_dir>/settings.txt
 fn saveSettings() void {
     const api = global_api orelse return;
     var dir_buf: [512]u8 = undefined;
@@ -134,10 +198,11 @@ fn saveSettings() void {
 }
 
 // -----------------------------------------------------------------------------
-// TDLib Object Constructors
+// Конструкторы структур данных TDLib (it.tdlight.jni.TdApi)
 // -----------------------------------------------------------------------------
 
-fn createFormattedText(env: *JNIEnv, text_slice: []const u8) ?jobject {
+/// Создаёт TDLib-объект FormattedText с пустым массивом TextEntity
+fn createFormattedText(env: *JNIEnv, text_slice: []const u8) jobject {
     const fmt_cls = JniAccessor.findClass(env, "it/tdlight/jni/TdApi$FormattedText") orelse return null;
     const text_entity_cls = JniAccessor.findClass(env, "it/tdlight/jni/TdApi$TextEntity") orelse return null;
 
@@ -150,7 +215,8 @@ fn createFormattedText(env: *JNIEnv, text_slice: []const u8) ?jobject {
 
     const empty_entities = if (env.*.NewObjectArray) |new_arr|
         new_arr(env, 0, text_entity_cls, null)
-    else return null;
+    else
+        return null;
 
     const fmt_ctor = env.*.GetMethodID.?(
         env,
@@ -166,9 +232,11 @@ fn createFormattedText(env: *JNIEnv, text_slice: []const u8) ?jobject {
 
     return if (env.*.NewObjectA) |new_a|
         new_a(env, fmt_cls, fmt_ctor, &fmt_args)
-    else null;
+    else
+        null;
 }
 
+/// Проверяет, валиден ли FormattedText для создания цитаты (не пустой и до 1024 символов)
 fn isFormattedTextValidForQuote(env: *JNIEnv, fmt_obj: jobject) bool {
     if (fmt_obj == null) return false;
     const fmt_cls = JniAccessor.getObjectClass(env, fmt_obj) orelse return false;
@@ -189,6 +257,7 @@ fn isFormattedTextValidForQuote(env: *JNIEnv, fmt_obj: jobject) bool {
     return (len > 0 and len <= 1024);
 }
 
+/// Извлекает строковое значение из FormattedText в предоставленный буфер
 fn getFormattedTextString(env: *JNIEnv, fmt_obj: jobject, out_buf: []u8) ?[]const u8 {
     if (fmt_obj == null) return null;
     const fmt_cls = JniAccessor.getObjectClass(env, fmt_obj) orelse return null;
@@ -208,7 +277,8 @@ fn getFormattedTextString(env: *JNIEnv, fmt_obj: jobject, out_buf: []u8) ?[]cons
     return out_buf[0..safe_slice.len];
 }
 
-fn createInputTextQuote(env: *JNIEnv, fmt_obj: jobject) ?jobject {
+/// Создаёт TDLib-объект InputTextQuote для прикрепления блока цитаты к сообщению
+fn createInputTextQuote(env: *JNIEnv, fmt_obj: jobject) jobject {
     const q_cls = JniAccessor.findClass(env, "it/tdlight/jni/TdApi$InputTextQuote") orelse return null;
     const q_ctor = env.*.GetMethodID.?(
         env,
@@ -222,10 +292,12 @@ fn createInputTextQuote(env: *JNIEnv, fmt_obj: jobject) ?jobject {
     };
     return if (env.*.NewObjectA) |new_a|
         new_a(env, q_cls, q_ctor, &q_args)
-    else null;
+    else
+        null;
 }
 
-fn createInputMessageReplyToMessage(env: *JNIEnv, msg_id: i64, quote_obj: jobject) ?jobject {
+/// Создаёт TDLib-объект InputMessageReplyToMessage с цитатой
+fn createInputMessageReplyToMessage(env: *JNIEnv, msg_id: i64, quote_obj: jobject) jobject {
     const reply_msg_cls = JniAccessor.findClass(env, "it/tdlight/jni/TdApi$InputMessageReplyToMessage") orelse return null;
     const reply_ctor = env.*.GetMethodID.?(
         env,
@@ -244,26 +316,32 @@ fn createInputMessageReplyToMessage(env: *JNIEnv, msg_id: i64, quote_obj: jobjec
 
     return if (env.*.NewObjectA) |new_a|
         new_a(env, reply_msg_cls, reply_ctor, &reply_args)
-    else null;
+    else
+        null;
 }
 
-fn createInputMessagePhoto(env: *JNIEnv, photo_path_z: [*:0]const u8, caption_obj: ?jobject) ?jobject {
+/// Создаёт TDLib-объект InputMessagePhoto для отправки локального PNG файла
+fn createInputMessagePhoto(env: *JNIEnv, photo_path_z: [*:0]const u8, caption_obj: jobject) jobject {
+    // 1. TdApi$InputFileLocal(path)
     const file_cls = JniAccessor.findClass(env, "it/tdlight/jni/TdApi$InputFileLocal") orelse return null;
     const file_ctor = env.*.GetMethodID.?(env, file_cls, "<init>", "(Ljava/lang/String;)V") orelse return null;
 
     const j_path_str = JniAccessor.newStringUtf(env, photo_path_z) orelse return null;
-    const file_args = [_]jvalue{ .{ .l = j_path_str } };
+    const file_args = [_]jvalue{.{ .l = j_path_str }};
     const input_file = if (env.*.NewObjectA) |new_a|
         new_a(env, file_cls, file_ctor, &file_args)
-    else return null;
+    else
+        return null;
     if (input_file == null) return null;
 
+    // 2. TdApi$InputPhoto()
     const photo_cls = JniAccessor.findClass(env, "it/tdlight/jni/TdApi$InputPhoto") orelse return null;
     const photo_ctor = env.*.GetMethodID.?(env, photo_cls, "<init>", "()V") orelse return null;
     const empty_args = [_]jvalue{};
     const input_photo = if (env.*.NewObjectA) |new_a|
         new_a(env, photo_cls, photo_ctor, &empty_args)
-    else return null;
+    else
+        return null;
     if (input_photo == null) return null;
 
     JniAccessor.setObjectField(env, input_photo, "photo", "Lit/tdlight/jni/TdApi$InputFile;", input_file);
@@ -273,11 +351,12 @@ fn createInputMessagePhoto(env: *JNIEnv, photo_path_z: [*:0]const u8, caption_ob
     const msg_photo_ctor = env.*.GetMethodID.?(env, msg_photo_cls, "<init>", "()V") orelse return null;
     const msg_photo = if (env.*.NewObjectA) |new_a|
         new_a(env, msg_photo_cls, msg_photo_ctor, &empty_args)
-    else return null;
+    else
+        return null;
     if (msg_photo == null) return null;
 
     JniAccessor.setObjectField(env, msg_photo, "photo", "Lit/tdlight/jni/TdApi$InputPhoto;", input_photo);
-    const final_caption: jobject = caption_obj orelse createFormattedText(env, "") orelse null;
+    const final_caption: jobject = if (caption_obj != null) caption_obj else createFormattedText(env, "");
     if (final_caption != null) {
         JniAccessor.setObjectField(env, msg_photo, "caption", "Lit/tdlight/jni/TdApi$FormattedText;", final_caption);
     }
@@ -285,7 +364,8 @@ fn createInputMessagePhoto(env: *JNIEnv, photo_path_z: [*:0]const u8, caption_ob
     return msg_photo;
 }
 
-fn getRawFormattedText(env: *JNIEnv, chat_id: i64, msg_id: i64) ?jobject {
+/// Получает оригинальный FormattedText сообщения через ConversationController
+fn getRawFormattedText(env: *JNIEnv, chat_id: i64, msg_id: i64) jobject {
     const conv_ctrl_cls = JniAccessor.findClass(env, "com/mandagram/ui/conversation/ConversationController") orelse return null;
     const inst_fid = env.*.GetStaticFieldID.?(
         env,
@@ -336,6 +416,7 @@ fn getRawFormattedText(env: *JNIEnv, chat_id: i64, msg_id: i64) ?jobject {
     return null;
 }
 
+/// Проверяет, является ли чат топиком форума или веткой комментариев канала
 fn isDiscussionGroup(env: *JNIEnv, chat_id: i64) bool {
     const service_cls = JniAccessor.findClass(env, "com/mandagram/network/TelegramService") orelse return false;
     const inst_fid = env.*.GetStaticFieldID.?(
@@ -378,9 +459,11 @@ fn isDiscussionGroup(env: *JNIEnv, chat_id: i64) bool {
 }
 
 // -----------------------------------------------------------------------------
-// Isolated Headless Compose Renderer (ImageComposeScene -> In-Memory PNG)
+// Вспомогательные функции загрузки классов Java / Kotlin
 // -----------------------------------------------------------------------------
-fn getClassLoaderFromObject(env: *JNIEnv, obj: jobject) ?jobject {
+
+/// Извлекает ClassLoader из переданного объекта Java
+fn getClassLoaderFromObject(env: *JNIEnv, obj: jobject) jobject {
     if (obj == null) return null;
     const item_cls = JniAccessor.getObjectClass(env, obj) orelse return null;
     defer if (env.*.DeleteLocalRef) |del| del(env, item_cls);
@@ -398,7 +481,8 @@ fn getClassLoaderFromObject(env: *JNIEnv, obj: jobject) ?jobject {
     return env.*.CallObjectMethod.?(env, item_cls, mid);
 }
 
-fn loadClass(env: *JNIEnv, loader: ?jobject, name_slashed: [*:0]const u8) ?jclass {
+/// Загружает класс через JNI FindClass или явно через переданный ClassLoader
+fn loadClass(env: *JNIEnv, loader: jobject, name_slashed: [*:0]const u8) jclass {
     if (env.*.FindClass) |f| {
         const cls = f(env, name_slashed);
         if (cls != null) return cls;
@@ -425,6 +509,13 @@ fn loadClass(env: *JNIEnv, loader: ?jobject, name_slashed: [*:0]const u8) ?jclas
     return res;
 }
 
+// -----------------------------------------------------------------------------
+// Рендерер Compose: Отрисовка MandaGramTheme -> MessageBubble
+// -----------------------------------------------------------------------------
+
+/// Состояние для двупроходной отрисовки Composable-дерева:
+/// Проход 0: Оборачивание в MandaGramTheme { ... }
+/// Проход 1: Отрисовка оригинального MessageBubble(...)
 const RenderState = struct {
     msg_item: jobject = null,
     is_group: bool = false,
@@ -433,9 +524,12 @@ const RenderState = struct {
     self_lambda: jobject = null,
 };
 
+/// Нативная C-функция, вызываемая рантаймом Compose через ComposeInterop bridge
 fn renderComposable(env: *JNIEnv, composer: jobject, user_data: usize) callconv(.c) void {
     const state: *RenderState = @ptrFromInt(user_data);
     if (state.pass == 0) {
+        // Проход 0: Запуск темы оформления MandaGramTheme, чтобы MessageBubble
+        // получил правильную цветовую палитру (MaterialTheme), типографику и форму пузыря
         state.pass = 1;
         defer state.pass = 0;
 
@@ -454,6 +548,7 @@ fn renderComposable(env: *JNIEnv, composer: jobject, user_data: usize) callconv(
         env.*.CallStaticVoidMethod.?(env, theme_kt, theme_mid, state.self_lambda, composer, @as(jint, 0));
         checkClearException(env);
     } else {
+        // Проход 1: Отрисовка оригинального MessageBubble из MandaGram
         const bubble_kt = loadClass(env, null, "com/mandagram/ui/chat/MessageBubbleKt") orelse return;
         defer if (env.*.DeleteLocalRef) |del| del(env, bubble_kt);
         const bubble_mid = env.*.GetStaticMethodID.?(
@@ -471,29 +566,30 @@ fn renderComposable(env: *JNIEnv, composer: jobject, user_data: usize) callconv(
             bubble_kt,
             bubble_mid,
             state.msg_item,
-            @as(jboolean, if (state.is_group) 1 else 0),
-            @as(jboolean, 1),
-            @as(jboolean, 1),
-            @as(jboolean, if (state.is_channel) 1 else 0),
-            @as(jlong, 0),
-            @as(jobject, null),
-            @as(jobject, null),
-            @as(jobject, null),
-            @as(jobject, null),
-            @as(jobject, null),
-            @as(jobject, null),
-            @as(jobject, null),
-            @as(jobject, null),
-            @as(jobject, null),
+            @as(jboolean, if (state.is_group) 1 else 0), // showAvatar
+            @as(jboolean, 1), // isFirst
+            @as(jboolean, 1), // isLast
+            @as(jboolean, if (state.is_channel) 1 else 0), // isChannelPost
+            @as(jlong, 0), // selection
+            @as(jobject, null), // onAvatarClick
+            @as(jobject, null), // onReplyClick
+            @as(jobject, null), // onMediaClick
+            @as(jobject, null), // onLinkClick
+            @as(jobject, null), // onUserClick
+            @as(jobject, null), // onChannelClick
+            @as(jobject, null), // onHashtagClick
+            @as(jobject, null), // onQuoteClick
+            @as(jobject, null), // searchQuery
             composer,
-            @as(jint, 54),
-            @as(jint, 0),
-            @as(jint, 0x7FC0),
+            @as(jint, 54), // $changed
+            @as(jint, 0), // $changed1
+            @as(jint, 0x7FC0), // $default
         );
         checkClearException(env);
     }
 }
 
+/// Определяет текущий цвет фона чата в ARGB на основе настроек ThemeManager
 pub fn getChatBackgroundColor(env: *JNIEnv) i32 {
     const theme_mgr_cls = JniAccessor.findClass(env, "com/mandagram/ui/theme/ThemeManager") orelse return @bitCast(@as(u32, 0xFF100D0B));
     defer if (env.*.DeleteLocalRef) |del| del(env, theme_mgr_cls);
@@ -529,9 +625,10 @@ pub fn getChatBackgroundColor(env: *JNIEnv) i32 {
     checkClearException(env);
 
     if (!is_dark) {
-        return @bitCast(@as(u32, 0xFFFDF8F6));
+        return @bitCast(@as(u32, 0xFFFDF8F6)); // Светлая тема
     }
 
+    // Проверяем выбранный MonetSeed: для PISTACHIO используется специфический оттенок
     const seed_mid = env.*.GetMethodID.?(env, theme_mgr_cls, "getSeedColor-0d7_KjU", "()J");
     if (seed_mid) |smid| {
         const seed = env.*.CallLongMethod.?(env, inst.?, smid);
@@ -549,7 +646,7 @@ pub fn getChatBackgroundColor(env: *JNIEnv) i32 {
                         const pist_color = env.*.CallLongMethod.?(env, pobj, cmid);
                         checkClearException(env);
                         if (seed == pist_color) {
-                            return @bitCast(@as(u32, 0xFF0F110D));
+                            return @bitCast(@as(u32, 0xFF0F110D)); // Тёмный фон Pistachio
                         }
                     }
                 }
@@ -557,8 +654,12 @@ pub fn getChatBackgroundColor(env: *JNIEnv) i32 {
         }
     }
     checkClearException(env);
-    return @bitCast(@as(u32, 0xFF100D0B));
+    return @bitCast(@as(u32, 0xFF100D0B)); // Тёмная тема по умолчанию
 }
+
+// -----------------------------------------------------------------------------
+// Кэширование файлов на диске
+// -----------------------------------------------------------------------------
 
 pub const CacheFileEntry = struct {
     name: [128]u8,
@@ -566,6 +667,7 @@ pub const CacheFileEntry = struct {
     mtime: i128,
 };
 
+/// Удаляет устаревшие файлы цитат, оставляя не более max_files самых свежих
 pub fn cleanupCacheDir(dir_path: []const u8, max_files: usize) void {
     var dir = std.fs.openDirAbsolute(dir_path, .{ .iterate = true }) catch return;
     defer dir.close();
@@ -603,6 +705,7 @@ pub fn cleanupCacheDir(dir_path: []const u8, max_files: usize) void {
     }
 }
 
+/// Получает путь к директории кэша для сгенерированных цитат
 pub fn getQuotesCacheDir(api: *const PluginApi, out_buf: []u8) ?[]const u8 {
     var cache_buf: [512]u8 = undefined;
     if (api.get_cache_dir) |get_dir| {
@@ -622,6 +725,7 @@ pub fn getQuotesCacheDir(api: *const PluginApi, out_buf: []u8) ?[]const u8 {
     return fallback;
 }
 
+/// Сохраняет сжатые байты PNG во временный файл в директории кэша
 pub fn savePngBytesToFile(
     api: *const PluginApi,
     bytes: []const u8,
@@ -651,10 +755,196 @@ pub fn savePngBytesToFile(
     return null;
 }
 
+// -----------------------------------------------------------------------------
+// Вспомогательные функции для работы со Skia (org.jetbrains.skia)
+// Разделяют глубокую вложенность JNI-вызовов на плоские, читаемые операции.
+// -----------------------------------------------------------------------------
+
+/// Создаёт растровый Skia Surface заданного размера (width x height) с форматом N32Premul
+fn createRasterSurface(env: *JNIEnv, loader: jobject, width: usize, height: usize) jobject {
+    const s_cls = loadClass(env, loader, "org/jetbrains/skia/Surface") orelse return null;
+    defer if (env.*.DeleteLocalRef) |del| del(env, s_cls);
+
+    const comp_fid = env.*.GetStaticFieldID.?(env, s_cls, "Companion", "Lorg/jetbrains/skia/Surface$Companion;") orelse return null;
+    const comp_obj = env.*.GetStaticObjectField.?(env, s_cls, comp_fid);
+    if (comp_obj == null) return null;
+    defer if (env.*.DeleteLocalRef) |del| del(env, comp_obj.?);
+
+    const comp_cls = loadClass(env, loader, "org/jetbrains/skia/Surface$Companion") orelse return null;
+    defer if (env.*.DeleteLocalRef) |del| del(env, comp_cls);
+
+    const make_raster_mid = env.*.GetMethodID.?(env, comp_cls, "makeRasterN32Premul", "(II)Lorg/jetbrains/skia/Surface;") orelse return null;
+    return env.*.CallObjectMethod.?(env, comp_obj.?, make_raster_mid, @as(jint, @intCast(width)), @as(jint, @intCast(height)));
+}
+
+/// Получает объект Canvas из Skia Surface
+fn getSurfaceCanvas(env: *JNIEnv, loader: jobject, surface: jobject) jobject {
+    const s_cls = loadClass(env, loader, "org/jetbrains/skia/Surface") orelse return null;
+    defer if (env.*.DeleteLocalRef) |del| del(env, s_cls);
+
+    const get_canvas_mid = env.*.GetMethodID.?(env, s_cls, "getCanvas", "()Lorg/jetbrains/skia/Canvas;") orelse return null;
+    return env.*.CallObjectMethod.?(env, surface, get_canvas_mid);
+}
+
+/// Заливает Canvas заданным цветом фона.
+/// ВАЖНО: В библиотеке Skiko метод Canvas.clear(int) возвращает сам Canvas (цепочечный вызов),
+/// поэтому его JNI сигнатура: (I)Lorg/jetbrains/skia/Canvas;
+fn clearCanvas(env: *JNIEnv, loader: jobject, canvas: jobject, color_argb: i32) void {
+    const cvs_cls = loadClass(env, loader, "org/jetbrains/skia/Canvas") orelse return;
+    defer if (env.*.DeleteLocalRef) |del| del(env, cvs_cls);
+
+    const clear_mid = env.*.GetMethodID.?(env, cvs_cls, "clear", "(I)Lorg/jetbrains/skia/Canvas;");
+    if (clear_mid) |clmid| {
+        const cl_ret = env.*.CallObjectMethod.?(env, canvas, clmid, color_argb);
+        if (cl_ret != null and env.*.DeleteLocalRef != null) env.*.DeleteLocalRef.?(env, cl_ret);
+    } else {
+        checkClearException(env);
+    }
+}
+
+/// Создаёт Skia Rect по 4 координатам (Left, Top, Right, Bottom)
+fn makeRectLTRB(env: *JNIEnv, loader: jobject, l: f32, t: f32, r: f32, b: f32) jobject {
+    const r_cls = loadClass(env, loader, "org/jetbrains/skia/Rect") orelse return null;
+    defer if (env.*.DeleteLocalRef) |del| del(env, r_cls);
+
+    const comp_fid = env.*.GetStaticFieldID.?(env, r_cls, "Companion", "Lorg/jetbrains/skia/Rect$Companion;") orelse return null;
+    const rc_obj = env.*.GetStaticObjectField.?(env, r_cls, comp_fid);
+    if (rc_obj == null) return null;
+    defer if (env.*.DeleteLocalRef) |del| del(env, rc_obj.?);
+
+    const rc_cls = loadClass(env, loader, "org/jetbrains/skia/Rect$Companion") orelse return null;
+    defer if (env.*.DeleteLocalRef) |del| del(env, rc_cls);
+
+    const make_ltrb_mid = env.*.GetMethodID.?(env, rc_cls, "makeLTRB", "(FFFF)Lorg/jetbrains/skia/Rect;") orelse return null;
+    return env.*.CallObjectMethod.?(env, rc_obj.?, make_ltrb_mid, @as(jfloat, l), @as(jfloat, t), @as(jfloat, r), @as(jfloat, b));
+}
+
+/// Создаёт Skia Rect по ширине и высоте (от точки 0,0 до w,h)
+fn makeRectWH(env: *JNIEnv, loader: jobject, w: f32, h: f32) jobject {
+    const r_cls = loadClass(env, loader, "org/jetbrains/skia/Rect") orelse return null;
+    defer if (env.*.DeleteLocalRef) |del| del(env, r_cls);
+
+    const comp_fid = env.*.GetStaticFieldID.?(env, r_cls, "Companion", "Lorg/jetbrains/skia/Rect$Companion;") orelse return null;
+    const rc_obj = env.*.GetStaticObjectField.?(env, r_cls, comp_fid);
+    if (rc_obj == null) return null;
+    defer if (env.*.DeleteLocalRef) |del| del(env, rc_obj.?);
+
+    const rc_cls = loadClass(env, loader, "org/jetbrains/skia/Rect$Companion") orelse return null;
+    defer if (env.*.DeleteLocalRef) |del| del(env, rc_cls);
+
+    const make_wh_mid = env.*.GetMethodID.?(env, rc_cls, "makeWH", "(FF)Lorg/jetbrains/skia/Rect;") orelse return null;
+    return env.*.CallObjectMethod.?(env, rc_obj.?, make_wh_mid, @as(jfloat, w), @as(jfloat, h));
+}
+
+/// Отрисовывает часть исходного Skia Image в целевой холст (drawImageRect)
+fn drawImageRect(env: *JNIEnv, loader: jobject, canvas: jobject, image: jobject, src_rect: jobject, dst_rect: jobject) void {
+    const cvs_cls = loadClass(env, loader, "org/jetbrains/skia/Canvas") orelse return;
+    defer if (env.*.DeleteLocalRef) |del| del(env, cvs_cls);
+
+    const draw_mid = env.*.GetMethodID.?(
+        env,
+        cvs_cls,
+        "drawImageRect",
+        "(Lorg/jetbrains/skia/Image;Lorg/jetbrains/skia/Rect;Lorg/jetbrains/skia/Rect;)Lorg/jetbrains/skia/Canvas;",
+    ) orelse return;
+
+    const cvs_ret = env.*.CallObjectMethod.?(env, canvas, draw_mid, image, src_rect, dst_rect);
+    if (cvs_ret != null and env.*.DeleteLocalRef != null) env.*.DeleteLocalRef.?(env, cvs_ret);
+}
+
+/// Создаёт снимок (Image Snapshot) с отрисованного Surface
+fn makeSurfaceSnapshot(env: *JNIEnv, loader: jobject, surface: jobject) jobject {
+    const s_cls = loadClass(env, loader, "org/jetbrains/skia/Surface") orelse return null;
+    defer if (env.*.DeleteLocalRef) |del| del(env, s_cls);
+
+    const make_snapshot_mid = env.*.GetMethodID.?(env, s_cls, "makeImageSnapshot", "()Lorg/jetbrains/skia/Image;") orelse return null;
+    return env.*.CallObjectMethod.?(env, surface, make_snapshot_mid);
+}
+
+/// Кодирует Skia Image в формат PNG и возвращает массив jbyteArray
+fn encodeImageToPngBytes(env: *JNIEnv, loader: jobject, image: jobject, quality: i32) jobject {
+    const img_cls = loadClass(env, loader, "org/jetbrains/skia/Image") orelse return null;
+    defer if (env.*.DeleteLocalRef) |del| del(env, img_cls);
+
+    const enc_fmt_cls = loadClass(env, loader, "org/jetbrains/skia/EncodedImageFormat") orelse return null;
+    defer if (env.*.DeleteLocalRef) |del| del(env, enc_fmt_cls);
+
+    const png_fid = env.*.GetStaticFieldID.?(env, enc_fmt_cls, "PNG", "Lorg/jetbrains/skia/EncodedImageFormat;") orelse return null;
+    const png_fmt = env.*.GetStaticObjectField.?(env, enc_fmt_cls, png_fid);
+    if (png_fmt == null) return null;
+    defer if (env.*.DeleteLocalRef) |del| del(env, png_fmt.?);
+
+    const encode_mid = env.*.GetMethodID.?(
+        env,
+        img_cls,
+        "encodeToData",
+        "(Lorg/jetbrains/skia/EncodedImageFormat;I)Lorg/jetbrains/skia/Data;",
+    ) orelse return null;
+
+    const data_obj = env.*.CallObjectMethod.?(env, image, encode_mid, png_fmt.?, @as(jint, quality));
+    if (data_obj == null) return null;
+    defer if (env.*.DeleteLocalRef) |del| del(env, data_obj);
+
+    const data_cls = loadClass(env, loader, "org/jetbrains/skia/Data") orelse return null;
+    defer if (env.*.DeleteLocalRef) |del| del(env, data_cls);
+
+    const get_bytes_mid = env.*.GetMethodID.?(env, data_cls, "getBytes", "()[B") orelse return null;
+    return env.*.CallObjectMethod.?(env, data_obj, get_bytes_mid);
+}
+
+/// Создаёт новый холст с размерами обрезанного пузыря, заливает его цветом фона чата,
+/// копирует туда пузырь и кодирует в PNG.
+fn renderCroppedBubbleImage(
+    env: *JNIEnv,
+    loader: jobject,
+    full_img: jobject,
+    l: usize,
+    t: usize,
+    r: usize,
+    b: usize,
+    w: usize,
+    h: usize,
+    bg_color: i32,
+) jobject {
+    // 1. Создаём растровый Surface целевого размера
+    const surface = createRasterSurface(env, loader, w, h) orelse return null;
+    defer if (env.*.DeleteLocalRef) |del| del(env, surface);
+
+    // 2. Получаем Canvas
+    const canvas = getSurfaceCanvas(env, loader, surface) orelse return null;
+    defer if (env.*.DeleteLocalRef) |del| del(env, canvas);
+
+    // 3. Заливаем фон холста цветом текущей темы (чтобы не было белых рамок)
+    clearCanvas(env, loader, canvas, bg_color);
+
+    // 4. Формируем прямоугольники источника и назначения
+    const src_rect = makeRectLTRB(env, loader, @floatFromInt(l), @floatFromInt(t), @floatFromInt(r), @floatFromInt(b)) orelse return null;
+    defer if (env.*.DeleteLocalRef) |del| del(env, src_rect);
+
+    const dst_rect = makeRectWH(env, loader, @floatFromInt(w), @floatFromInt(h)) orelse return null;
+    defer if (env.*.DeleteLocalRef) |del| del(env, dst_rect);
+
+    // 5. Отрисовываем фрагмент изображения в новый холст
+    drawImageRect(env, loader, canvas, full_img, src_rect, dst_rect);
+
+    // 6. Снимаем готовое изображение
+    const snapshot = makeSurfaceSnapshot(env, loader, surface) orelse return null;
+    defer if (env.*.DeleteLocalRef) |del| del(env, snapshot);
+
+    // 7. Сжимаем в PNG
+    return encodeImageToPngBytes(env, loader, snapshot, 100);
+}
+
+// -----------------------------------------------------------------------------
+// Рендеринг MessageItem в PNG файл на диске
+// -----------------------------------------------------------------------------
+
 fn renderMessageItemToFile(env: *JNIEnv, msg_item: jobject, out_path_buf: []u8) ?[:0]const u8 {
     const api = global_api orelse return null;
     if (msg_item == null) return null;
 
+    // PushLocalFrame гарантирует, что все локальные JNI-ссылки внутри этой функции
+    // будут автоматически освобождены при выходе, предотвращая переполнение JNI-таблицы.
     if (env.*.PushLocalFrame) |push| {
         if (push(env, 64) != 0) return null;
     }
@@ -684,7 +974,7 @@ fn renderMessageItemToFile(env: *JNIEnv, msg_item: jobject, out_path_buf: []u8) 
         .self_lambda = null,
     };
 
-    // 1. Create composable lambda
+    // 1. Создаём Composable-лямбду через встроенный мост ComposeInterop ядра MandaGram
     const interop_cls = loadClass(env, loader, "com/mandagram/plugin/bridge/ComposeInterop") orelse {
         logErrFmt("[renderMessageItemToFile] Failed to find ComposeInterop", .{});
         return null;
@@ -713,7 +1003,7 @@ fn renderMessageItemToFile(env: *JNIEnv, msg_item: jobject, out_path_buf: []u8) 
     defer if (env.*.DeleteLocalRef) |del| del(env, lambda);
     state.self_lambda = lambda;
 
-    // 2. Prepare Density and CoroutineContext
+    // 2. Создаём Density (масштабирование интерфейса 1.0) и EmptyCoroutineContext
     const density_kt = loadClass(env, loader, "androidx/compose/ui/unit/DensityKt") orelse return null;
     defer if (env.*.DeleteLocalRef) |del| del(env, density_kt);
     const density_mid = env.*.GetStaticMethodID.?(
@@ -736,7 +1026,7 @@ fn renderMessageItemToFile(env: *JNIEnv, msg_item: jobject, out_path_buf: []u8) 
     const empty_ctx = env.*.GetStaticObjectField.?(env, empty_ctx_cls, empty_ctx_fid);
     defer if (env.*.DeleteLocalRef) |del| del(env, empty_ctx);
 
-    // 3. Construct ImageComposeScene
+    // 3. Создаём ImageComposeScene для Headless-рендеринга без открытия окна ОС
     const scene_cls = loadClass(env, loader, "androidx/compose/ui/ImageComposeScene") orelse return null;
     defer if (env.*.DeleteLocalRef) |del| del(env, scene_cls);
     const scene_init_mid = env.*.GetMethodID.?(
@@ -747,8 +1037,8 @@ fn renderMessageItemToFile(env: *JNIEnv, msg_item: jobject, out_path_buf: []u8) 
     ) orelse return null;
 
     var scene_args = [_]jvalue{
-        .{ .i = 650 },
-        .{ .i = 1500 },
+        .{ .i = 650 }, // Максимальная ширина холста (хватает для любого десктопного сообщения)
+        .{ .i = 1500 }, // Максимальная высота холста
         .{ .l = density_obj },
         .{ .l = empty_ctx },
         .{ .l = lambda },
@@ -769,6 +1059,7 @@ fn renderMessageItemToFile(env: *JNIEnv, msg_item: jobject, out_path_buf: []u8) 
     const close_mid = env.*.GetMethodID.?(env, scene_cls, "close", "()V") orelse return null;
     defer env.*.CallVoidMethod.?(env, scene, close_mid);
 
+    // Вызываем рендеринг кадра Compose в Skia Image
     const render_mid = env.*.GetMethodID.?(env, scene_cls, "render", "(J)Lorg/jetbrains/skia/Image;") orelse return null;
     const full_img = env.*.CallObjectMethod.?(env, scene, render_mid, @as(jlong, 0));
     if (full_img == null) {
@@ -778,33 +1069,16 @@ fn renderMessageItemToFile(env: *JNIEnv, msg_item: jobject, out_path_buf: []u8) 
     }
     defer if (env.*.DeleteLocalRef) |del| del(env, full_img);
 
-    // 4. Bounding box pixel scan on native Skia memory
+    // 4. Сканирование нативной памяти Skia Pixmap для поиска границ пузыря сообщения.
+    // Получаем прямой указатель на байты пикселей в нативной куче (без копирования в Java-массив).
     const img_cls = loadClass(env, loader, "org/jetbrains/skia/Image") orelse return null;
     defer if (env.*.DeleteLocalRef) |del| del(env, img_cls);
-
-    const enc_fmt_cls = loadClass(env, loader, "org/jetbrains/skia/EncodedImageFormat") orelse return null;
-    defer if (env.*.DeleteLocalRef) |del| del(env, enc_fmt_cls);
-    const png_fid = env.*.GetStaticFieldID.?(env, enc_fmt_cls, "PNG", "Lorg/jetbrains/skia/EncodedImageFormat;") orelse return null;
-    const png_fmt = env.*.GetStaticObjectField.?(env, enc_fmt_cls, png_fid);
-    defer if (env.*.DeleteLocalRef) |del| del(env, png_fmt);
-
-    const encode_mid = env.*.GetMethodID.?(
-        env,
-        img_cls,
-        "encodeToData",
-        "(Lorg/jetbrains/skia/EncodedImageFormat;I)Lorg/jetbrains/skia/Data;",
-    ) orelse return null;
-
-    const data_cls = loadClass(env, loader, "org/jetbrains/skia/Data") orelse return null;
-    defer if (env.*.DeleteLocalRef) |del| del(env, data_cls);
-    const get_bytes_mid = env.*.GetMethodID.?(env, data_cls, "getBytes", "()[B") orelse return null;
 
     const peek_mid = env.*.GetMethodID.?(env, img_cls, "peekPixels", "()Lorg/jetbrains/skia/Pixmap;");
     const pixmap = if (peek_mid) |pmid| env.*.CallObjectMethod.?(env, full_img, pmid) else null;
     defer if (pixmap != null and env.*.DeleteLocalRef != null) env.*.DeleteLocalRef.?(env, pixmap);
 
     const chat_bg = getChatBackgroundColor(env);
-
     var final_bytes_obj: jobject = null;
 
     if (pixmap != null) {
@@ -823,6 +1097,7 @@ fn renderMessageItemToFile(env: *JNIEnv, msg_item: jobject, out_path_buf: []u8) 
                     const row_bytes: usize = @intCast(row_bytes_val);
                     const ptr: [*]const u8 = @ptrFromInt(@as(usize, @intCast(addr)));
 
+                    // Поиск первой непустой строки (minY) сверху вниз
                     var minY: usize = h;
                     var maxY: usize = 0;
                     var found_any = false;
@@ -832,7 +1107,7 @@ fn renderMessageItemToFile(env: *JNIEnv, msg_item: jobject, out_path_buf: []u8) 
                         const row_offset = y * row_bytes;
                         var x: usize = 0;
                         while (x < w) : (x += 1) {
-                            if (ptr[row_offset + x * 4 + 3] > 0) {
+                            if (ptr[row_offset + x * 4 + 3] > 0) { // Проверка альфа-канала (Alpha > 0)
                                 minY = y;
                                 found_any = true;
                                 break;
@@ -842,6 +1117,7 @@ fn renderMessageItemToFile(env: *JNIEnv, msg_item: jobject, out_path_buf: []u8) 
                     }
 
                     if (found_any) {
+                        // Поиск последней непустой строки (maxY) снизу вверх
                         y = h;
                         while (y > minY) {
                             y -= 1;
@@ -856,6 +1132,7 @@ fn renderMessageItemToFile(env: *JNIEnv, msg_item: jobject, out_path_buf: []u8) 
                             if (maxY != 0) break;
                         }
 
+                        // Поиск горизонтальных границ (minX и maxX)
                         var minX: usize = w;
                         var maxX: usize = 0;
                         y = minY;
@@ -879,6 +1156,7 @@ fn renderMessageItemToFile(env: *JNIEnv, msg_item: jobject, out_path_buf: []u8) 
                         }
 
                         if (minX <= maxX and minY <= maxY) {
+                            // Добавляем отступ 6px вокруг пузыря для естественного вида
                             const pad: usize = 6;
                             const min_x_padded = if (minX >= pad) minX - pad else 0;
                             const min_y_padded = if (minY >= pad) minY - pad else 0;
@@ -887,89 +1165,19 @@ fn renderMessageItemToFile(env: *JNIEnv, msg_item: jobject, out_path_buf: []u8) 
                             const crop_w = max_x_padded - min_x_padded;
                             const crop_h = max_y_padded - min_y_padded;
 
-                            const surf_cls = loadClass(env, loader, "org/jetbrains/skia/Surface");
-                            if (surf_cls) |s_cls| {
-                                defer if (env.*.DeleteLocalRef) |del| del(env, s_cls);
-                                const comp_fid = env.*.GetStaticFieldID.?(env, s_cls, "Companion", "Lorg/jetbrains/skia/Surface$Companion;");
-                                if (comp_fid) |cfid| {
-                                    const comp_obj = env.*.GetStaticObjectField.?(env, s_cls, cfid);
-                                    if (comp_obj) |cobj| {
-                                        defer if (env.*.DeleteLocalRef) |del| del(env, cobj);
-                                        const comp_cls = loadClass(env, loader, "org/jetbrains/skia/Surface$Companion");
-                                        if (comp_cls) |cp_cls| {
-                                            defer if (env.*.DeleteLocalRef) |del| del(env, cp_cls);
-                                            const make_raster_mid = env.*.GetMethodID.?(env, cp_cls, "makeRasterN32Premul", "(II)Lorg/jetbrains/skia/Surface;");
-                                            if (make_raster_mid) |mrmid| {
-                                                const surface = env.*.CallObjectMethod.?(env, cobj, mrmid, @as(jint, @intCast(crop_w)), @as(jint, @intCast(crop_h)));
-                                                if (surface) |surf| {
-                                                    defer if (env.*.DeleteLocalRef) |del| del(env, surf);
-                                                    const get_canvas_mid = env.*.GetMethodID.?(env, s_cls, "getCanvas", "()Lorg/jetbrains/skia/Canvas;");
-                                                    if (get_canvas_mid) |gcmid| {
-                                                        const canvas = env.*.CallObjectMethod.?(env, surf, gcmid);
-                                                        if (canvas) |cvs| {
-                                                            defer if (env.*.DeleteLocalRef) |del| del(env, cvs);
-                                                            const canvas_cls = loadClass(env, loader, "org/jetbrains/skia/Canvas");
-                                                            if (canvas_cls) |cvs_cls| {
-                                                                defer if (env.*.DeleteLocalRef) |del| del(env, cvs_cls);
-                                                                const clear_mid = env.*.GetMethodID.?(env, cvs_cls, "clear", "(I)Lorg/jetbrains/skia/Canvas;");
-                                                                if (clear_mid) |clmid| {
-                                                                    const cl_ret = env.*.CallObjectMethod.?(env, cvs, clmid, chat_bg);
-                                                                    if (cl_ret != null and env.*.DeleteLocalRef != null) env.*.DeleteLocalRef.?(env, cl_ret);
-                                                                } else {
-                                                                    checkClearException(env);
-                                                                }
-
-                                                                const rect_cls = loadClass(env, loader, "org/jetbrains/skia/Rect");
-                                                                if (rect_cls) |r_cls| {
-                                                                    defer if (env.*.DeleteLocalRef) |del| del(env, r_cls);
-                                                                    const rect_comp_fid = env.*.GetStaticFieldID.?(env, r_cls, "Companion", "Lorg/jetbrains/skia/Rect$Companion;");
-                                                                    if (rect_comp_fid) |rcfid| {
-                                                                        const rect_comp = env.*.GetStaticObjectField.?(env, r_cls, rcfid);
-                                                                        if (rect_comp) |rc_obj| {
-                                                                            defer if (env.*.DeleteLocalRef) |del| del(env, rc_obj);
-                                                                            const rect_comp_cls = loadClass(env, loader, "org/jetbrains/skia/Rect$Companion");
-                                                                            if (rect_comp_cls) |rc_cls| {
-                                                                                defer if (env.*.DeleteLocalRef) |del| del(env, rc_cls);
-                                                                                const make_ltrb_mid = env.*.GetMethodID.?(env, rc_cls, "makeLTRB", "(FFFF)Lorg/jetbrains/skia/Rect;");
-                                                                                const make_wh_mid = env.*.GetMethodID.?(env, rc_cls, "makeWH", "(FF)Lorg/jetbrains/skia/Rect;");
-                                                                                if (make_ltrb_mid != null and make_wh_mid != null) {
-                                                                                    const src_rect = env.*.CallObjectMethod.?(env, rc_obj, make_ltrb_mid.?, @as(jfloat, @floatFromInt(min_x_padded)), @as(jfloat, @floatFromInt(min_y_padded)), @as(jfloat, @floatFromInt(max_x_padded)), @as(jfloat, @floatFromInt(max_y_padded)));
-                                                                                    defer if (src_rect != null and env.*.DeleteLocalRef != null) env.*.DeleteLocalRef.?(env, src_rect);
-                                                                                    const dst_rect = env.*.CallObjectMethod.?(env, rc_obj, make_wh_mid.?, @as(jfloat, @floatFromInt(crop_w)), @as(jfloat, @floatFromInt(crop_h)));
-                                                                                    defer if (dst_rect != null and env.*.DeleteLocalRef != null) env.*.DeleteLocalRef.?(env, dst_rect);
-
-                                                                                    const draw_mid = env.*.GetMethodID.?(env, cvs_cls, "drawImageRect", "(Lorg/jetbrains/skia/Image;Lorg/jetbrains/skia/Rect;Lorg/jetbrains/skia/Rect;)Lorg/jetbrains/skia/Canvas;");
-                                                                                    if (draw_mid) |dmid| {
-                                                                                        const cvs_ret = env.*.CallObjectMethod.?(env, cvs, dmid, full_img, src_rect, dst_rect);
-                                                                                        defer if (cvs_ret != null and env.*.DeleteLocalRef != null) env.*.DeleteLocalRef.?(env, cvs_ret);
-
-                                                                                        const make_snapshot_mid = env.*.GetMethodID.?(env, s_cls, "makeImageSnapshot", "()Lorg/jetbrains/skia/Image;");
-                                                                                        if (make_snapshot_mid) |msmid| {
-                                                                                            const snapshot = env.*.CallObjectMethod.?(env, surf, msmid);
-                                                                                            if (snapshot) |snap| {
-                                                                                                defer if (env.*.DeleteLocalRef) |del| del(env, snap);
-                                                                                                const data_obj = env.*.CallObjectMethod.?(env, snap, encode_mid, png_fmt, @as(jint, 100));
-                                                                                                if (data_obj) |dobj| {
-                                                                                                    defer if (env.*.DeleteLocalRef) |del| del(env, dobj);
-                                                                                                    final_bytes_obj = env.*.CallObjectMethod.?(env, dobj, get_bytes_mid);
-                                                                                                }
-                                                                                            }
-                                                                                        }
-                                                                                    }
-                                                                                }
-                                                                            }
-                                                                        }
-                                                                    }
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
+                            // Отрисовка обрезанного изображения в новый Canvas нужного цвета фона
+                            final_bytes_obj = renderCroppedBubbleImage(
+                                env,
+                                loader,
+                                full_img,
+                                min_x_padded,
+                                min_y_padded,
+                                max_x_padded,
+                                max_y_padded,
+                                crop_w,
+                                crop_h,
+                                chat_bg,
+                            );
                         }
                     }
                 }
@@ -977,13 +1185,9 @@ fn renderMessageItemToFile(env: *JNIEnv, msg_item: jobject, out_path_buf: []u8) 
         }
     }
 
-    // Fallback: encode full image directly
+    // Запасной вариант (fallback): если координаты определить не удалось, кодируем всё изображение целиком
     if (final_bytes_obj == null) {
-        const data_obj = env.*.CallObjectMethod.?(env, full_img, encode_mid, png_fmt, @as(jint, 100));
-        if (data_obj) |dobj| {
-            defer if (env.*.DeleteLocalRef) |del| del(env, dobj);
-            final_bytes_obj = env.*.CallObjectMethod.?(env, dobj, get_bytes_mid);
-        }
+        final_bytes_obj = encodeImageToPngBytes(env, loader, full_img, 100);
     }
 
     if (final_bytes_obj == null) {
@@ -996,6 +1200,8 @@ fn renderMessageItemToFile(env: *JNIEnv, msg_item: jobject, out_path_buf: []u8) 
     if (len <= 0) return null;
 
     const ulen: usize = @intCast(len);
+
+    // Извлечение байтов из jbyteArray на стек или через прямой доступ
     if (env.*.GetByteArrayRegion) |getRegion| {
         var stack_buf: [65536]i8 = undefined;
         if (ulen <= stack_buf.len) {
@@ -1018,7 +1224,14 @@ fn renderMessageItemToFile(env: *JNIEnv, msg_item: jobject, out_path_buf: []u8) 
     return null;
 }
 
-fn extractMessageItemDetails(
+// -----------------------------------------------------------------------------
+// Кэширование текста сообщения из MessageItem
+// -----------------------------------------------------------------------------
+
+/// Извлекает текстовую составляющую сообщения для последующего использования в TDLib InputTextQuote.
+/// Не извлекает неиспользуемые поля (автор, время, аватар), так как Compose MessageBubble
+/// отрисовывает их самостоятельно из самого объекта MessageItem.
+fn cacheMessageItemText(
     env: *JNIEnv,
     msg_item: jobject,
     target: *PendingQuoteState,
@@ -1034,23 +1247,9 @@ fn extractMessageItemDetails(
 
     const item_cls = JniAccessor.getObjectClass(env, msg_item) orelse return;
     target.msg_id = JniAccessor.getLongField(env, msg_item, "id");
-    target.sender_id = JniAccessor.getLongField(env, msg_item, "senderId");
-
-    // 1. Author (senderName)
-    target.author_len = 0;
-    const get_name_mid = env.*.GetMethodID.?(env, item_cls, "getSenderName", "()Ljava/lang/String;");
-    const j_name = if (get_name_mid) |mid| env.*.CallObjectMethod.?(env, msg_item, mid) else null;
-    if (j_name != null) {
-        if (JniAccessor.getStringUtfChars(env, j_name)) |chars| {
-            defer JniAccessor.releaseStringUtfChars(env, j_name, chars);
-            const slice = utf8Truncate(std.mem.span(chars), target.author_buf.len);
-            @memcpy(target.author_buf[0..slice.len], slice);
-            target.author_len = slice.len;
-        }
-    }
-
-    // 2. Text (text or documentFileName)
     target.text_len = 0;
+
+    // Пытаемся получить getText(), а если это файл/документ — getDocumentFileName()
     const get_text_mid = env.*.GetMethodID.?(env, item_cls, "getText", "()Ljava/lang/String;");
     var j_text = if (get_text_mid) |mid| env.*.CallObjectMethod.?(env, msg_item, mid) else null;
     if (j_text == null) {
@@ -1060,119 +1259,90 @@ fn extractMessageItemDetails(
         }
     }
     if (j_text != null) {
-        if (JniAccessor.getStringUtfChars(env, j_text)) |chars| {
-            defer JniAccessor.releaseStringUtfChars(env, j_text, chars);
+        if (JniAccessor.getStringUtfChars(env, j_text.?)) |chars| {
+            defer JniAccessor.releaseStringUtfChars(env, j_text.?, chars);
             const slice = utf8Truncate(std.mem.span(chars), target.text_buf.len);
             @memcpy(target.text_buf[0..slice.len], slice);
             target.text_len = slice.len;
         }
     }
-
-    // 3. Time (formattedTime)
-    target.time_len = 0;
-    const get_time_mid = env.*.GetMethodID.?(env, item_cls, "getFormattedTime", "()Ljava/lang/String;");
-    const j_time = if (get_time_mid) |mid| env.*.CallObjectMethod.?(env, msg_item, mid) else null;
-    if (j_time != null) {
-        if (JniAccessor.getStringUtfChars(env, j_time)) |chars| {
-            defer JniAccessor.releaseStringUtfChars(env, j_time, chars);
-            const slice = utf8Truncate(std.mem.span(chars), target.time_buf.len);
-            @memcpy(target.time_buf[0..slice.len], slice);
-            target.time_len = slice.len;
-        }
-    }
-
-    // 4. Avatar (senderAvatarPath)
-    target.avatar_len = 0;
-    const get_avatar_mid = env.*.GetMethodID.?(env, item_cls, "getSenderAvatarPath", "()Ljava/lang/String;");
-    const j_avatar = if (get_avatar_mid) |mid| env.*.CallObjectMethod.?(env, msg_item, mid) else null;
-    if (j_avatar != null) {
-        if (JniAccessor.getStringUtfChars(env, j_avatar)) |chars| {
-            defer JniAccessor.releaseStringUtfChars(env, j_avatar, chars);
-            const slice = utf8Truncate(std.mem.span(chars), target.avatar_buf.len);
-            @memcpy(target.avatar_buf[0..slice.len], slice);
-            target.avatar_len = slice.len;
-        }
-    }
-
-    // 5. Initials (senderInitials)
-    target.initials_len = 0;
-    const get_initials_mid = env.*.GetMethodID.?(env, item_cls, "getSenderInitials", "()Ljava/lang/String;");
-    const j_initials = if (get_initials_mid) |mid| env.*.CallObjectMethod.?(env, msg_item, mid) else null;
-    if (j_initials != null) {
-        if (JniAccessor.getStringUtfChars(env, j_initials)) |chars| {
-            defer JniAccessor.releaseStringUtfChars(env, j_initials, chars);
-            const slice = utf8Truncate(std.mem.span(chars), target.initials_buf.len);
-            @memcpy(target.initials_buf[0..slice.len], slice);
-            target.initials_len = slice.len;
-        }
-    }
-}
-
-fn findMessageItemInTelegramService(env: *JNIEnv, target_id: i64) ?jobject {
-    if (env.*.PushLocalFrame) |push| {
-        if (push(env, 32) != 0) return null;
-    }
-    var found_item: jobject = null;
-    defer {
-        if (env.*.PopLocalFrame) |pop| {
-            _ = pop(env, found_item);
-        }
-    }
-
-    const service_cls = JniAccessor.findClass(env, "com/mandagram/network/TelegramService") orelse return null;
-    const inst_fid = env.*.GetStaticFieldID.?(
-        env,
-        service_cls,
-        "INSTANCE",
-        "Lcom/mandagram/network/TelegramService;",
-    ) orelse return null;
-    const service_inst = env.*.GetStaticObjectField.?(env, service_cls, inst_fid) orelse return null;
-
-    const get_messages_mid = env.*.GetMethodID.?(
-        env,
-        service_cls,
-        "getMessages",
-        "()Lkotlinx/coroutines/flow/StateFlow;",
-    ) orelse return null;
-    const flow_obj = env.*.CallObjectMethod.?(env, service_inst, get_messages_mid) orelse return null;
-
-    const flow_cls = JniAccessor.getObjectClass(env, flow_obj) orelse return null;
-    const get_val_mid = env.*.GetMethodID.?(
-        env,
-        flow_cls,
-        "getValue",
-        "()Ljava/lang/Object;",
-    ) orelse return null;
-    const list_obj = env.*.CallObjectMethod.?(env, flow_obj, get_val_mid) orelse return null;
-
-    const list_cls = JniAccessor.getObjectClass(env, list_obj) orelse return null;
-    const size_mid = env.*.GetMethodID.?(env, list_cls, "size", "()I") orelse return null;
-    const get_mid = env.*.GetMethodID.?(env, list_cls, "get", "(I)Ljava/lang/Object;") orelse return null;
-
-    const size = env.*.CallIntMethod.?(env, list_obj, size_mid);
-    var i: i32 = size - 1;
-    const min_i: i32 = if (size > 200) size - 200 else 0;
-    while (i >= min_i) : (i -= 1) {
-        const item = env.*.CallObjectMethod.?(env, list_obj, get_mid, i);
-        if (item != null) {
-            const item_id = JniAccessor.getLongField(env, item, "id");
-            if (item_id == target_id) {
-                found_item = item;
-                break;
-            }
-            if (env.*.DeleteLocalRef) |del| del(env, item);
-        }
-    }
-    return found_item;
 }
 
 // -----------------------------------------------------------------------------
-// Hook 1: ChatComposerActions#beginReply (Lcom/mandagram/models/MessageItem;)V
+// Поиск MessageItem в памяти клиента MandaGram
+// -----------------------------------------------------------------------------
+
+/// Ищет объект MessageItem по ID в текущем списке сообщений TelegramService.messages.
+/// ВАЖНО: Использует PopLocalFrame(env, found_item) для возврата ссылки в родительский фрейм.
+/// Это исключает баг с "висячей ссылкой" (dangling pointer / use-after-free на JNI-ссылке).
+fn findMessageItemInTelegramService(env: *JNIEnv, target_id: i64) jobject {
+    const push = env.*.PushLocalFrame orelse return null;
+    const pop = env.*.PopLocalFrame orelse return null;
+    if (push(env, 32) != 0) return null;
+
+    var found_item: jobject = null;
+    search: {
+        const service_cls = JniAccessor.findClass(env, "com/mandagram/network/TelegramService") orelse break :search;
+        const inst_fid = env.*.GetStaticFieldID.?(
+            env,
+            service_cls,
+            "INSTANCE",
+            "Lcom/mandagram/network/TelegramService;",
+        ) orelse break :search;
+        const service_inst = env.*.GetStaticObjectField.?(env, service_cls, inst_fid) orelse break :search;
+
+        const get_messages_mid = env.*.GetMethodID.?(
+            env,
+            service_cls,
+            "getMessages",
+            "()Lkotlinx/coroutines/flow/StateFlow;",
+        ) orelse break :search;
+        const flow_obj = env.*.CallObjectMethod.?(env, service_inst, get_messages_mid) orelse break :search;
+
+        const flow_cls = JniAccessor.getObjectClass(env, flow_obj) orelse break :search;
+        const get_val_mid = env.*.GetMethodID.?(
+            env,
+            flow_cls,
+            "getValue",
+            "()Ljava/lang/Object;",
+        ) orelse break :search;
+        const list_obj = env.*.CallObjectMethod.?(env, flow_obj, get_val_mid) orelse break :search;
+
+        const list_cls = JniAccessor.getObjectClass(env, list_obj) orelse break :search;
+        const size_mid = env.*.GetMethodID.?(env, list_cls, "size", "()I") orelse break :search;
+        const get_mid = env.*.GetMethodID.?(env, list_cls, "get", "(I)Ljava/lang/Object;") orelse break :search;
+
+        const size = env.*.CallIntMethod.?(env, list_obj, size_mid);
+        var i: i32 = size - 1;
+        const min_i: i32 = if (size > 200) size - 200 else 0;
+        while (i >= min_i) : (i -= 1) {
+            const item = env.*.CallObjectMethod.?(env, list_obj, get_mid, i);
+            if (item != null) {
+                const item_id = JniAccessor.getLongField(env, item, "id");
+                if (item_id == target_id) {
+                    found_item = item;
+                    break;
+                }
+                if (env.*.DeleteLocalRef) |del| del(env, item);
+            }
+        }
+    }
+
+    // PopLocalFrame закрывает текущий фрейм локальных ссылок и возвращает
+    // валидную ссылку для found_item в вызывающий родительский фрейм.
+    return pop(env, found_item);
+}
+
+// -----------------------------------------------------------------------------
+// Перехватчик 1: Клик "Ответить" на сообщении (ChatComposerActions#beginReply)
+// Заранее рендерит пузырь сообщения в фоне, пока пользователь вводит текст.
 // -----------------------------------------------------------------------------
 
 fn on_before_begin_reply(param: *HookParam) callconv(.c) void {
     if (!is_active.load(.seq_cst)) return;
     const env = param.getEnv() orelse return;
+    ensureJvmCached(env);
+
     if (param.args_count < 1) return;
     const msg_item = param.args[0] orelse return;
 
@@ -1180,7 +1350,7 @@ fn on_before_begin_reply(param: *HookParam) callconv(.c) void {
     if (msg_id == 0) return;
 
     quote_mutex.lock();
-    extractMessageItemDetails(env, msg_item, &pending_quote);
+    cacheMessageItemText(env, msg_item, &pending_quote);
     pending_quote.captured_path_len = 0;
     if (cached_message_item) |old_ref| {
         if (env.*.DeleteGlobalRef) |del| del(env, old_ref);
@@ -1206,12 +1376,15 @@ fn on_before_begin_reply(param: *HookParam) callconv(.c) void {
 }
 
 // -----------------------------------------------------------------------------
-// Hook 2: ChatComposerActions#sendDraft ()V
+// Перехватчик 2: Нажатие кнопки "Отправить" (ChatComposerActions#sendDraft)
+// Если предрендеринг не успел завершиться — дорисовывает перед отправкой.
 // -----------------------------------------------------------------------------
 
 fn on_before_send_draft(param: *HookParam) callconv(.c) void {
     if (!is_active.load(.seq_cst)) return;
     const env = param.getEnv() orelse return;
+    ensureJvmCached(env);
+
     const this_obj = param.this_ptr orelse return;
 
     const actions_cls = JniAccessor.getObjectClass(env, this_obj) orelse return;
@@ -1246,7 +1419,7 @@ fn on_before_send_draft(param: *HookParam) callconv(.c) void {
     quote_mutex.lock();
     const already_rendered = (pending_quote.msg_id == reply_id and pending_quote.captured_path_len > 0);
     if (!already_rendered) {
-        extractMessageItemDetails(env, reply_item, &pending_quote);
+        cacheMessageItemText(env, reply_item, &pending_quote);
         if (cached_message_item) |old_ref| {
             if (env.*.DeleteGlobalRef) |del| del(env, old_ref);
         }
@@ -1270,12 +1443,14 @@ fn on_before_send_draft(param: *HookParam) callconv(.c) void {
 }
 
 // -----------------------------------------------------------------------------
-// Hook 3 & 4: Outgoing SendMessage Transformation (Text -> Photo with Caption)
+// Перехватчики 3 и 4: Модификация исходящего TDLib SendMessage запроса
+// Превращает текстовое сообщение с ответом в фотографию с цитатой и подписью.
 // -----------------------------------------------------------------------------
 
 fn handle_send_function(env: *JNIEnv, source_hook: [*:0]const u8, func_obj: jobject) void {
     if (!is_active.load(.seq_cst)) return;
     if (func_obj == null) return;
+    ensureJvmCached(env);
 
     const send_msg_cls = JniAccessor.findClass(env, "it/tdlight/jni/TdApi$SendMessage");
     const is_send_msg = (send_msg_cls != null and env.*.IsInstanceOf.?(env, func_obj, send_msg_cls.?) != 0);
@@ -1298,6 +1473,7 @@ fn handle_send_function(env: *JNIEnv, source_hook: [*:0]const u8, func_obj: jobj
     const input_content = JniAccessor.getObjectField(env, func_obj, "inputMessageContent", "Lit/tdlight/jni/TdApi$InputMessageContent;");
     if (input_content == null) return;
 
+    // Не заменяем, если пользователь уже сам отправляет фото
     const msg_photo_cls = JniAccessor.findClass(env, "it/tdlight/jni/TdApi$InputMessagePhoto");
     if (msg_photo_cls != null and env.*.IsInstanceOf.?(env, input_content, msg_photo_cls.?) != 0) return;
 
@@ -1305,6 +1481,7 @@ fn handle_send_function(env: *JNIEnv, source_hook: [*:0]const u8, func_obj: jobj
     const is_text = (msg_text_cls != null and env.*.IsInstanceOf.?(env, input_content, msg_text_cls.?) != 0);
     if (!is_text) return;
 
+    // Исходный набранный пользователем текст становится подписью (caption) к фото-цитате
     const outgoing_caption = JniAccessor.getObjectField(env, input_content, "text", "Lit/tdlight/jni/TdApi$FormattedText;");
 
     var text_buf: [4096]u8 = undefined;
@@ -1313,11 +1490,12 @@ fn handle_send_function(env: *JNIEnv, source_hook: [*:0]const u8, func_obj: jobj
     quote_mutex.lock();
     if (pending_quote.msg_id != msg_id or pending_quote.text_len == 0) {
         if (findMessageItemInTelegramService(env, msg_id)) |found| {
-            extractMessageItemDetails(env, found, &pending_quote);
+            cacheMessageItemText(env, found, &pending_quote);
             if (cached_message_item) |old_ref| {
                 if (env.*.DeleteGlobalRef) |del| del(env, old_ref);
             }
             cached_message_item = if (env.*.NewGlobalRef) |new_g| new_g(env, found) else null;
+            if (env.*.DeleteLocalRef) |del| del(env, found);
         }
     }
 
@@ -1352,15 +1530,20 @@ fn handle_send_function(env: *JNIEnv, source_hook: [*:0]const u8, func_obj: jobj
 
     if (photo_path == null) {
         var target_item: ?jobject = null;
+        var needs_local_cleanup = false;
         if (item_ref) |ref| {
             const cur_id = JniAccessor.getLongField(env, ref, "id");
             if (cur_id == msg_id) target_item = ref;
         }
         if (target_item == null) {
             target_item = findMessageItemInTelegramService(env, msg_id);
+            needs_local_cleanup = true;
         }
         if (target_item) |item| {
             photo_path = renderMessageItemToFile(env, item, &captured_buf);
+            if (needs_local_cleanup and env.*.DeleteLocalRef != null) {
+                env.*.DeleteLocalRef.?(env, item);
+            }
         }
     }
 
@@ -1369,12 +1552,14 @@ fn handle_send_function(env: *JNIEnv, source_hook: [*:0]const u8, func_obj: jobj
         return;
     };
 
+    // Создаём объект InputMessagePhoto и подменяем inputMessageContent
     const input_photo_msg = createInputMessagePhoto(env, final_photo, outgoing_caption);
     if (input_photo_msg == null) return;
 
     JniAccessor.setObjectField(env, func_obj, "inputMessageContent", "Lit/tdlight/jni/TdApi$InputMessageContent;", input_photo_msg.?);
     logFmt("[{s}] Success: outgoing reply transformed into authentic Compose quote photo!", .{source_hook});
 
+    // Добавляем к ответу нативный блок цитаты Telegram (InputTextQuote)
     var fmt_obj: ?jobject = getRawFormattedText(env, chat_id, msg_id);
     if (fmt_obj == null or !isFormattedTextValidForQuote(env, fmt_obj.?)) {
         fmt_obj = createFormattedText(env, text_slice);
@@ -1388,9 +1573,12 @@ fn handle_send_function(env: *JNIEnv, source_hook: [*:0]const u8, func_obj: jobj
     }
 }
 
+/// Хук для сетевого вызова TdLibSession#requestForSession
 fn on_before_request_for_session(param: *HookParam) callconv(.c) void {
     if (!is_active.load(.seq_cst)) return;
     const env = param.getEnv() orelse return;
+    ensureJvmCached(env);
+
     var i: u32 = 0;
     while (i < param.args_count) : (i += 1) {
         if (param.args[i]) |arg| {
@@ -1399,9 +1587,12 @@ fn on_before_request_for_session(param: *HookParam) callconv(.c) void {
     }
 }
 
+/// Хук для сетевого вызова SimpleTelegramClient#send
 fn on_before_client_send(param: *HookParam) callconv(.c) void {
     if (!is_active.load(.seq_cst)) return;
     const env = param.getEnv() orelse return;
+    ensureJvmCached(env);
+
     var i: u32 = 0;
     while (i < param.args_count) : (i += 1) {
         if (param.args[i]) |arg| {
@@ -1411,9 +1602,10 @@ fn on_before_client_send(param: *HookParam) callconv(.c) void {
 }
 
 // -----------------------------------------------------------------------------
-// Settings & Lifecycle
+// Пользовательские действия и Жизненный цикл плагина
 // -----------------------------------------------------------------------------
 
+/// Обработчик переключения настройки "Отправлять цитаты в обсуждениях"
 fn on_toggle_setting_click(chat_id: i64, user_data: usize) callconv(.c) void {
     _ = chat_id;
     _ = user_data;
@@ -1426,13 +1618,16 @@ fn on_toggle_setting_click(chat_id: i64, user_data: usize) callconv(.c) void {
     }
 }
 
+/// Точка входа инициализации плагина MandaGram (mandagram_plugin_init).
+/// Регистрирует перехватчики (хуки) методов JVM через ByteBuddy / MandaGram HookEngine.
 pub export fn mandagram_plugin_init(api: *const PluginApi) callconv(.c) bool {
     global_api = api;
     is_active.store(true, .seq_cst);
-    api.log_info("KvoteReply", "Initializing KvoteReply plugin v1.0.0 (by OwnerTS)");
+    api.log_info("KvoteReply", "Initializing KvoteReply plugin v2.0.0 (Pure Zig, Headless Skia)");
 
     loadSettings(api);
 
+    // 1. Хук на выбор сообщения для ответа в UI
     _ = api.register_hook(
         "com/mandagram/ui/chat/ChatComposerActions",
         "beginReply",
@@ -1441,6 +1636,7 @@ pub export fn mandagram_plugin_init(api: *const PluginApi) callconv(.c) bool {
         null,
     );
 
+    // 2. Хук на нажатие кнопки отправки в поле ввода
     _ = api.register_hook(
         "com/mandagram/ui/chat/ChatComposerActions",
         "sendDraft",
@@ -1449,6 +1645,7 @@ pub export fn mandagram_plugin_init(api: *const PluginApi) callconv(.c) bool {
         null,
     );
 
+    // 3. Хук на отправку пакета запроса в сессии TDLib
     _ = api.register_hook(
         "com/mandagram/network/engine/TdLibSession",
         "requestForSession",
@@ -1457,6 +1654,7 @@ pub export fn mandagram_plugin_init(api: *const PluginApi) callconv(.c) bool {
         null,
     );
 
+    // 4. Запасной хук на прямой вызов клиента tdlight-java
     _ = api.register_hook(
         "it/tdlight/client/SimpleTelegramClient",
         "send",
@@ -1465,6 +1663,7 @@ pub export fn mandagram_plugin_init(api: *const PluginApi) callconv(.c) bool {
         null,
     );
 
+    // 5. Регистрация пункта в контекстном меню чата
     if (api.register_chat_action) |reg_action| {
         _ = reg_action("toggle_discussions", "KvoteReply: Toggle Discussion Quotes", on_toggle_setting_click, 0);
     }
@@ -1472,14 +1671,33 @@ pub export fn mandagram_plugin_init(api: *const PluginApi) callconv(.c) bool {
     return true;
 }
 
+/// Точка входа выгрузки плагина (mandagram_plugin_unload).
+/// Корректно освобождает глобальные JNI-ссылки через кэшированный JavaVM pointer,
+/// очищает состояние и предотвращает утечки памяти в куче JVM.
 pub export fn mandagram_plugin_unload() callconv(.c) void {
     is_active.store(false, .seq_cst);
     if (global_api) |api| {
-        api.log_info("KvoteReply", "Unloading KvoteReply plugin v1.0.0");
+        api.log_info("KvoteReply", "Unloading KvoteReply plugin v2.0.0");
     }
 
     quote_mutex.lock();
-    cached_message_item = null;
+    // ОСВОБОЖДЕНИЕ ГЛОБАЛЬНОЙ ССЫЛКИ JNI:
+    // Простого присваивания cached_message_item = null недостаточно!
+    // Без вызова DeleteGlobalRef объект MessageItem останется в JVM heap навсегда (GC root leak).
+    if (cached_message_item) |item| {
+        if (global_jvm) |jvm| {
+            var raw_env: ?*anyopaque = null;
+            if (jvm.getEnv(&raw_env, plugin_api.JNI_VERSION_1_6) == 0) {
+                if (raw_env) |penv| {
+                    const env: *JNIEnv = @ptrCast(@alignCast(penv));
+                    if (env.*.DeleteGlobalRef) |del| {
+                        del(env, item);
+                    }
+                }
+            }
+        }
+        cached_message_item = null;
+    }
     pending_quote = .{};
     quote_mutex.unlock();
 }
