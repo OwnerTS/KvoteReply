@@ -1,4 +1,4 @@
-# KvoteReply v2.0.0
+# KvoteReply v1.0.0
 
 Pixel-perfect authentic Compose message bubble photo quote replies for [MandaGram](https://github.com/OwnerTS/MandaGram).
 

@@ -1,5 +1,5 @@
 //! ============================================================================
-//! KvoteReply v2.0.0 — Pure Zig Compose Quote Renderer Plugin for MandaGram
+//! KvoteReply v1.0.0 — Pure Zig Compose Quote Renderer Plugin for MandaGram
 //!
 //! Данный плагин перехватывает исходящие ответы на сообщения в Telegram и
 //! превращает их в фото-цитаты с аутентичным внешним видом Compose Desktop:
@@ -56,7 +56,7 @@ var disable_in_discussions: bool = false;
 /// Метаданные плагина, экспортируемые ядру MandaGram
 pub const METADATA = plugin_api.PluginMetadata{
     .name = "KvoteReply",
-    .version = "2.0.0",
+    .version = "1.0.0",
     .author = "OwnerTS",
     .description = "Pixel-perfect authentic Compose message bubble photo quote replies for MandaGram (Pure Zig, Headless Skia).",
 };
@@ -1623,7 +1623,7 @@ fn on_toggle_setting_click(chat_id: i64, user_data: usize) callconv(.c) void {
 pub export fn mandagram_plugin_init(api: *const PluginApi) callconv(.c) bool {
     global_api = api;
     is_active.store(true, .seq_cst);
-    api.log_info("KvoteReply", "Initializing KvoteReply plugin v2.0.0 (Pure Zig, Headless Skia)");
+    api.log_info("KvoteReply", "Initializing KvoteReply plugin v1.0.0 (Pure Zig, Headless Skia)");
 
     loadSettings(api);
 
@@ -1677,7 +1677,7 @@ pub export fn mandagram_plugin_init(api: *const PluginApi) callconv(.c) bool {
 pub export fn mandagram_plugin_unload() callconv(.c) void {
     is_active.store(false, .seq_cst);
     if (global_api) |api| {
-        api.log_info("KvoteReply", "Unloading KvoteReply plugin v2.0.0");
+        api.log_info("KvoteReply", "Unloading KvoteReply plugin v1.0.0");
     }
 
     quote_mutex.lock();
