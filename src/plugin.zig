@@ -9,6 +9,9 @@ const jobject = plugin_api.jobject;
 const jclass = plugin_api.jclass;
 const jvalue = plugin_api.jvalue;
 const jint = plugin_api.jint;
+const jlong = plugin_api.jlong;
+const jboolean = plugin_api.jboolean;
+const jfloat = plugin_api.jfloat;
 
 var global_api: ?*const PluginApi = null;
 var is_active = std.atomic.Value(bool).init(true);
@@ -377,19 +380,6 @@ fn isDiscussionGroup(env: *JNIEnv, chat_id: i64) bool {
 // -----------------------------------------------------------------------------
 // Isolated Headless Compose Renderer (ImageComposeScene -> In-Memory PNG)
 // -----------------------------------------------------------------------------
-
-const BUBBLE_RENDERER_CLASS = @embedFile("bytecode/BubbleRendererV3.class");
-
-const DefineClassFn = *const fn (
-    env: *JNIEnv,
-    name: ?[*:0]const u8,
-    loader: jobject,
-    buf: [*]const u8,
-    len: jint,
-) callconv(.c) jclass;
-
-var bubble_renderer_class: ?jclass = null;
-
 fn getClassLoaderFromObject(env: *JNIEnv, obj: jobject) ?jobject {
     if (obj == null) return null;
     const item_cls = JniAccessor.getObjectClass(env, obj) orelse return null;
@@ -408,58 +398,100 @@ fn getClassLoaderFromObject(env: *JNIEnv, obj: jobject) ?jobject {
     return env.*.CallObjectMethod.?(env, item_cls, mid);
 }
 
-fn getAppClassLoader(env: *JNIEnv) ?jobject {
-    const item_cls = JniAccessor.findClass(env, "com/mandagram/models/MessageItem") orelse return null;
-    defer if (env.*.DeleteLocalRef) |del| del(env, item_cls);
-    const cls_cls = JniAccessor.getObjectClass(env, item_cls) orelse return null;
-    defer if (env.*.DeleteLocalRef) |del| del(env, cls_cls);
-    const mid = env.*.GetMethodID.?(
-        env,
-        cls_cls,
-        "getClassLoader",
-        "()Ljava/lang/ClassLoader;",
-    ) orelse return null;
-    return env.*.CallObjectMethod.?(env, item_cls, mid);
-}
-
-fn ensureBubbleRendererLoaded(env: *JNIEnv, opt_loader: ?jobject) ?jclass {
-    if (bubble_renderer_class) |cls| return cls;
-
-    if (env.*.FindClass.?(env, "com/mandagram/plugin/quotereply/BubbleRendererV3")) |existing| {
-        bubble_renderer_class = env.*.NewGlobalRef.?(env, existing);
-        return bubble_renderer_class;
+fn loadClass(env: *JNIEnv, loader: ?jobject, name_slashed: [*:0]const u8) ?jclass {
+    if (env.*.FindClass) |f| {
+        const cls = f(env, name_slashed);
+        if (cls != null) return cls;
+        checkClearException(env);
     }
-    checkClearException(env);
+    const ldr = loader orelse return null;
+    var dotted_buf: [256]u8 = undefined;
+    var i: usize = 0;
+    while (name_slashed[i] != 0 and i < dotted_buf.len - 1) : (i += 1) {
+        dotted_buf[i] = if (name_slashed[i] == '/') '.' else name_slashed[i];
+    }
+    dotted_buf[i] = 0;
 
-    const loader = opt_loader orelse getAppClassLoader(env) orelse {
-        logErrFmt("[ensureBubbleRendererLoaded] No ClassLoader found", .{});
-        return null;
-    };
-    defer if (opt_loader == null) {
-        if (env.*.DeleteLocalRef) |del| del(env, loader);
-    };
-
-    const define_class: DefineClassFn = @ptrCast(env.*.DefineClass orelse {
-        logErrFmt("[ensureBubbleRendererLoaded] DefineClass is null in JNIEnv", .{});
-        return null;
-    });
-
-    const cls = define_class(
-        env,
-        "com/mandagram/plugin/quotereply/BubbleRendererV3",
-        loader,
-        BUBBLE_RENDERER_CLASS.ptr,
-        @intCast(BUBBLE_RENDERER_CLASS.len),
-    );
-    if (cls == null) {
-        logErrFmt("[ensureBubbleRendererLoaded] DefineClass returned null for BubbleRendererV3", .{});
+    const loader_cls = JniAccessor.getObjectClass(env, ldr) orelse return null;
+    defer if (env.*.DeleteLocalRef) |del| del(env, loader_cls);
+    const mid = env.*.GetMethodID.?(env, loader_cls, "loadClass", "(Ljava/lang/String;)Ljava/lang/Class;") orelse {
         checkClearException(env);
         return null;
-    }
+    };
+    const jname = env.*.NewStringUTF.?(env, dotted_buf[0..i :0]);
+    defer if (env.*.DeleteLocalRef) |del| del(env, jname);
+    const res = env.*.CallObjectMethod.?(env, ldr, mid, jname);
+    checkClearException(env);
+    return res;
+}
 
-    bubble_renderer_class = env.*.NewGlobalRef.?(env, cls);
-    logFmt("BubbleRendererV3 successfully loaded via JNI DefineClass", .{});
-    return bubble_renderer_class;
+const RenderState = struct {
+    msg_item: jobject = null,
+    is_group: bool = false,
+    is_channel: bool = false,
+    pass: u32 = 0,
+    self_lambda: jobject = null,
+};
+
+fn renderComposable(env: *JNIEnv, composer: jobject, user_data: usize) callconv(.c) void {
+    const state: *RenderState = @ptrFromInt(user_data);
+    if (state.pass == 0) {
+        state.pass = 1;
+        defer state.pass = 0;
+
+        const theme_kt = loadClass(env, null, "com/mandagram/ui/theme/ThemeKt") orelse return;
+        defer if (env.*.DeleteLocalRef) |del| del(env, theme_kt);
+        const theme_mid = env.*.GetStaticMethodID.?(
+            env,
+            theme_kt,
+            "MandaGramTheme",
+            "(Lkotlin/jvm/functions/Function2;Landroidx/compose/runtime/Composer;I)V",
+        ) orelse {
+            checkClearException(env);
+            return;
+        };
+
+        env.*.CallStaticVoidMethod.?(env, theme_kt, theme_mid, state.self_lambda, composer, @as(jint, 0));
+        checkClearException(env);
+    } else {
+        const bubble_kt = loadClass(env, null, "com/mandagram/ui/chat/MessageBubbleKt") orelse return;
+        defer if (env.*.DeleteLocalRef) |del| del(env, bubble_kt);
+        const bubble_mid = env.*.GetStaticMethodID.?(
+            env,
+            bubble_kt,
+            "MessageBubble",
+            "(Lcom/mandagram/models/MessageItem;ZZZZJLkotlin/jvm/functions/Function1;Lkotlin/jvm/functions/Function1;Lkotlin/jvm/functions/Function2;Lkotlin/jvm/functions/Function1;Lkotlin/jvm/functions/Function1;Lkotlin/jvm/functions/Function1;Lkotlin/jvm/functions/Function2;Lkotlin/jvm/functions/Function0;Ljava/lang/String;Landroidx/compose/runtime/Composer;III)V",
+        ) orelse {
+            checkClearException(env);
+            return;
+        };
+
+        env.*.CallStaticVoidMethod.?(
+            env,
+            bubble_kt,
+            bubble_mid,
+            state.msg_item,
+            @as(jboolean, if (state.is_group) 1 else 0),
+            @as(jboolean, 1),
+            @as(jboolean, 1),
+            @as(jboolean, if (state.is_channel) 1 else 0),
+            @as(jlong, 0),
+            @as(jobject, null),
+            @as(jobject, null),
+            @as(jobject, null),
+            @as(jobject, null),
+            @as(jobject, null),
+            @as(jobject, null),
+            @as(jobject, null),
+            @as(jobject, null),
+            @as(jobject, null),
+            composer,
+            @as(jint, 54),
+            @as(jint, 0),
+            @as(jint, 0x7FC0),
+        );
+        checkClearException(env);
+    }
 }
 
 pub fn getChatBackgroundColor(env: *JNIEnv) i32 {
@@ -623,57 +655,360 @@ fn renderMessageItemToFile(env: *JNIEnv, msg_item: jobject, out_path_buf: []u8) 
     const api = global_api orelse return null;
     if (msg_item == null) return null;
 
+    if (env.*.PushLocalFrame) |push| {
+        if (push(env, 64) != 0) return null;
+    }
+    defer {
+        if (env.*.PopLocalFrame) |pop| {
+            _ = pop(env, null);
+        }
+    }
+
     const loader = getClassLoaderFromObject(env, msg_item);
     defer if (loader != null) {
         if (env.*.DeleteLocalRef) |del| del(env, loader.?);
     };
 
-    const renderer_cls = ensureBubbleRendererLoaded(env, loader) orelse {
-        logErrFmt("[renderMessageItemToFile] ensureBubbleRendererLoaded failed", .{});
-        return null;
+    const item_cls = JniAccessor.getObjectClass(env, msg_item) orelse return null;
+    const is_outgoing_mid = env.*.GetMethodID.?(env, item_cls, "isOutgoing", "()Z") orelse return null;
+    const is_outgoing = env.*.CallBooleanMethod.?(env, msg_item, is_outgoing_mid) != 0;
+
+    const is_channel_mid = env.*.GetMethodID.?(env, item_cls, "isChannelPost", "()Z") orelse return null;
+    const is_channel = env.*.CallBooleanMethod.?(env, msg_item, is_channel_mid) != 0;
+
+    var state = RenderState{
+        .msg_item = msg_item,
+        .is_group = (!is_outgoing and !is_channel),
+        .is_channel = is_channel,
+        .pass = 0,
+        .self_lambda = null,
     };
 
-    const mid = env.*.GetStaticMethodID.?(
+    // 1. Create composable lambda
+    const interop_cls = loadClass(env, loader, "com/mandagram/plugin/bridge/ComposeInterop") orelse {
+        logErrFmt("[renderMessageItemToFile] Failed to find ComposeInterop", .{});
+        return null;
+    };
+    defer if (env.*.DeleteLocalRef) |del| del(env, interop_cls);
+
+    const create_mid = env.*.GetStaticMethodID.?(
         env,
-        renderer_cls,
-        "renderMessageToPng",
-        "(Lcom/mandagram/models/MessageItem;I)[B",
+        interop_cls,
+        "createComposableLambda",
+        "(JJ)Ljava/lang/Object;",
     ) orelse {
-        logErrFmt("[renderMessageItemToFile] GetStaticMethodID renderMessageToPng failed", .{});
+        logErrFmt("[renderMessageItemToFile] Failed to find createComposableLambda", .{});
         checkClearException(env);
         return null;
     };
+
+    const cb_ptr: jlong = @intCast(@intFromPtr(&renderComposable));
+    const user_data: jlong = @intCast(@intFromPtr(&state));
+    const lambda = env.*.CallStaticObjectMethod.?(env, interop_cls, create_mid, cb_ptr, user_data);
+    if (lambda == null) {
+        logErrFmt("[renderMessageItemToFile] createComposableLambda returned null", .{});
+        checkClearException(env);
+        return null;
+    }
+    defer if (env.*.DeleteLocalRef) |del| del(env, lambda);
+    state.self_lambda = lambda;
+
+    // 2. Prepare Density and CoroutineContext
+    const density_kt = loadClass(env, loader, "androidx/compose/ui/unit/DensityKt") orelse return null;
+    defer if (env.*.DeleteLocalRef) |del| del(env, density_kt);
+    const density_mid = env.*.GetStaticMethodID.?(
+        env,
+        density_kt,
+        "Density",
+        "(FF)Landroidx/compose/ui/unit/Density;",
+    ) orelse return null;
+    const density_obj = env.*.CallStaticObjectMethod.?(env, density_kt, density_mid, @as(jfloat, 1.0), @as(jfloat, 1.0));
+    defer if (env.*.DeleteLocalRef) |del| del(env, density_obj);
+
+    const empty_ctx_cls = loadClass(env, loader, "kotlin/coroutines/EmptyCoroutineContext") orelse return null;
+    defer if (env.*.DeleteLocalRef) |del| del(env, empty_ctx_cls);
+    const empty_ctx_fid = env.*.GetStaticFieldID.?(
+        env,
+        empty_ctx_cls,
+        "INSTANCE",
+        "Lkotlin/coroutines/EmptyCoroutineContext;",
+    ) orelse return null;
+    const empty_ctx = env.*.GetStaticObjectField.?(env, empty_ctx_cls, empty_ctx_fid);
+    defer if (env.*.DeleteLocalRef) |del| del(env, empty_ctx);
+
+    // 3. Construct ImageComposeScene
+    const scene_cls = loadClass(env, loader, "androidx/compose/ui/ImageComposeScene") orelse return null;
+    defer if (env.*.DeleteLocalRef) |del| del(env, scene_cls);
+    const scene_init_mid = env.*.GetMethodID.?(
+        env,
+        scene_cls,
+        "<init>",
+        "(IILandroidx/compose/ui/unit/Density;Lkotlin/coroutines/CoroutineContext;Lkotlin/jvm/functions/Function2;)V",
+    ) orelse return null;
+
+    var scene_args = [_]jvalue{
+        .{ .i = 650 },
+        .{ .i = 1500 },
+        .{ .l = density_obj },
+        .{ .l = empty_ctx },
+        .{ .l = lambda },
+    };
+    const scene = env.*.NewObjectA.?(
+        env,
+        scene_cls,
+        scene_init_mid,
+        &scene_args,
+    );
+    if (scene == null) {
+        logErrFmt("[renderMessageItemToFile] Failed to instantiate ImageComposeScene", .{});
+        checkClearException(env);
+        return null;
+    }
+    defer if (env.*.DeleteLocalRef) |del| del(env, scene);
+
+    const close_mid = env.*.GetMethodID.?(env, scene_cls, "close", "()V") orelse return null;
+    defer env.*.CallVoidMethod.?(env, scene, close_mid);
+
+    const render_mid = env.*.GetMethodID.?(env, scene_cls, "render", "(J)Lorg/jetbrains/skia/Image;") orelse return null;
+    const full_img = env.*.CallObjectMethod.?(env, scene, render_mid, @as(jlong, 0));
+    if (full_img == null) {
+        logErrFmt("[renderMessageItemToFile] scene.render returned null", .{});
+        checkClearException(env);
+        return null;
+    }
+    defer if (env.*.DeleteLocalRef) |del| del(env, full_img);
+
+    // 4. Bounding box pixel scan on native Skia memory
+    const img_cls = loadClass(env, loader, "org/jetbrains/skia/Image") orelse return null;
+    defer if (env.*.DeleteLocalRef) |del| del(env, img_cls);
+
+    const enc_fmt_cls = loadClass(env, loader, "org/jetbrains/skia/EncodedImageFormat") orelse return null;
+    defer if (env.*.DeleteLocalRef) |del| del(env, enc_fmt_cls);
+    const png_fid = env.*.GetStaticFieldID.?(env, enc_fmt_cls, "PNG", "Lorg/jetbrains/skia/EncodedImageFormat;") orelse return null;
+    const png_fmt = env.*.GetStaticObjectField.?(env, enc_fmt_cls, png_fid);
+    defer if (env.*.DeleteLocalRef) |del| del(env, png_fmt);
+
+    const encode_mid = env.*.GetMethodID.?(
+        env,
+        img_cls,
+        "encodeToData",
+        "(Lorg/jetbrains/skia/EncodedImageFormat;I)Lorg/jetbrains/skia/Data;",
+    ) orelse return null;
+
+    const data_cls = loadClass(env, loader, "org/jetbrains/skia/Data") orelse return null;
+    defer if (env.*.DeleteLocalRef) |del| del(env, data_cls);
+    const get_bytes_mid = env.*.GetMethodID.?(env, data_cls, "getBytes", "()[B") orelse return null;
+
+    const peek_mid = env.*.GetMethodID.?(env, img_cls, "peekPixels", "()Lorg/jetbrains/skia/Pixmap;");
+    const pixmap = if (peek_mid) |pmid| env.*.CallObjectMethod.?(env, full_img, pmid) else null;
+    defer if (pixmap != null and env.*.DeleteLocalRef != null) env.*.DeleteLocalRef.?(env, pixmap);
 
     const chat_bg = getChatBackgroundColor(env);
-    const j_res = env.*.CallStaticObjectMethod.?(env, renderer_cls, mid, msg_item, chat_bg);
-    if (j_res == null) {
-        logErrFmt("[renderMessageItemToFile] renderMessageToPng returned null", .{});
-        checkClearException(env);
-        return null;
-    }
-    defer if (env.*.DeleteLocalRef) |del| del(env, j_res);
 
-    const jbarr = j_res;
-    const len = env.*.GetArrayLength.?(env, jbarr);
-    if (len <= 0) {
-        logErrFmt("[renderMessageItemToFile] renderMessageToPng returned empty byte array", .{});
+    var final_bytes_obj: jobject = null;
+
+    if (pixmap != null) {
+        const pixmap_cls = loadClass(env, loader, "org/jetbrains/skia/Pixmap");
+        if (pixmap_cls) |px_cls| {
+            defer if (env.*.DeleteLocalRef) |del| del(env, px_cls);
+            const get_addr_mid = env.*.GetMethodID.?(env, px_cls, "getAddr", "()J");
+            const get_row_bytes_mid = env.*.GetMethodID.?(env, px_cls, "getRowBytes", "()I");
+
+            if (get_addr_mid != null and get_row_bytes_mid != null) {
+                const addr = env.*.CallLongMethod.?(env, pixmap, get_addr_mid.?);
+                const row_bytes_val = env.*.CallIntMethod.?(env, pixmap, get_row_bytes_mid.?);
+                if (addr != 0 and row_bytes_val > 0) {
+                    const w: usize = 650;
+                    const h: usize = 1500;
+                    const row_bytes: usize = @intCast(row_bytes_val);
+                    const ptr: [*]const u8 = @ptrFromInt(@as(usize, @intCast(addr)));
+
+                    var minY: usize = h;
+                    var maxY: usize = 0;
+                    var found_any = false;
+
+                    var y: usize = 0;
+                    while (y < h) : (y += 1) {
+                        const row_offset = y * row_bytes;
+                        var x: usize = 0;
+                        while (x < w) : (x += 1) {
+                            if (ptr[row_offset + x * 4 + 3] > 0) {
+                                minY = y;
+                                found_any = true;
+                                break;
+                            }
+                        }
+                        if (found_any) break;
+                    }
+
+                    if (found_any) {
+                        y = h;
+                        while (y > minY) {
+                            y -= 1;
+                            const row_offset = y * row_bytes;
+                            var x: usize = 0;
+                            while (x < w) : (x += 1) {
+                                if (ptr[row_offset + x * 4 + 3] > 0) {
+                                    maxY = y;
+                                    break;
+                                }
+                            }
+                            if (maxY != 0) break;
+                        }
+
+                        var minX: usize = w;
+                        var maxX: usize = 0;
+                        y = minY;
+                        while (y <= maxY) : (y += 1) {
+                            const row_offset = y * row_bytes;
+                            var x: usize = 0;
+                            while (x < minX) : (x += 1) {
+                                if (ptr[row_offset + x * 4 + 3] > 0) {
+                                    minX = x;
+                                    break;
+                                }
+                            }
+                            x = w;
+                            while (x > maxX) {
+                                x -= 1;
+                                if (ptr[row_offset + x * 4 + 3] > 0) {
+                                    maxX = x;
+                                    break;
+                                }
+                            }
+                        }
+
+                        if (minX <= maxX and minY <= maxY) {
+                            const pad: usize = 6;
+                            const min_x_padded = if (minX >= pad) minX - pad else 0;
+                            const min_y_padded = if (minY >= pad) minY - pad else 0;
+                            const max_x_padded = @min(w, maxX + 1 + pad);
+                            const max_y_padded = @min(h, maxY + 1 + pad);
+                            const crop_w = max_x_padded - min_x_padded;
+                            const crop_h = max_y_padded - min_y_padded;
+
+                            const surf_cls = loadClass(env, loader, "org/jetbrains/skia/Surface");
+                            if (surf_cls) |s_cls| {
+                                defer if (env.*.DeleteLocalRef) |del| del(env, s_cls);
+                                const comp_fid = env.*.GetStaticFieldID.?(env, s_cls, "Companion", "Lorg/jetbrains/skia/Surface$Companion;");
+                                if (comp_fid) |cfid| {
+                                    const comp_obj = env.*.GetStaticObjectField.?(env, s_cls, cfid);
+                                    if (comp_obj) |cobj| {
+                                        defer if (env.*.DeleteLocalRef) |del| del(env, cobj);
+                                        const comp_cls = loadClass(env, loader, "org/jetbrains/skia/Surface$Companion");
+                                        if (comp_cls) |cp_cls| {
+                                            defer if (env.*.DeleteLocalRef) |del| del(env, cp_cls);
+                                            const make_raster_mid = env.*.GetMethodID.?(env, cp_cls, "makeRasterN32Premul", "(II)Lorg/jetbrains/skia/Surface;");
+                                            if (make_raster_mid) |mrmid| {
+                                                const surface = env.*.CallObjectMethod.?(env, cobj, mrmid, @as(jint, @intCast(crop_w)), @as(jint, @intCast(crop_h)));
+                                                if (surface) |surf| {
+                                                    defer if (env.*.DeleteLocalRef) |del| del(env, surf);
+                                                    const get_canvas_mid = env.*.GetMethodID.?(env, s_cls, "getCanvas", "()Lorg/jetbrains/skia/Canvas;");
+                                                    if (get_canvas_mid) |gcmid| {
+                                                        const canvas = env.*.CallObjectMethod.?(env, surf, gcmid);
+                                                        if (canvas) |cvs| {
+                                                            defer if (env.*.DeleteLocalRef) |del| del(env, cvs);
+                                                            const canvas_cls = loadClass(env, loader, "org/jetbrains/skia/Canvas");
+                                                            if (canvas_cls) |cvs_cls| {
+                                                                defer if (env.*.DeleteLocalRef) |del| del(env, cvs_cls);
+                                                                const clear_mid = env.*.GetMethodID.?(env, cvs_cls, "clear", "(I)Lorg/jetbrains/skia/Canvas;");
+                                                                if (clear_mid) |clmid| {
+                                                                    const cl_ret = env.*.CallObjectMethod.?(env, cvs, clmid, chat_bg);
+                                                                    if (cl_ret != null and env.*.DeleteLocalRef != null) env.*.DeleteLocalRef.?(env, cl_ret);
+                                                                } else {
+                                                                    checkClearException(env);
+                                                                }
+
+                                                                const rect_cls = loadClass(env, loader, "org/jetbrains/skia/Rect");
+                                                                if (rect_cls) |r_cls| {
+                                                                    defer if (env.*.DeleteLocalRef) |del| del(env, r_cls);
+                                                                    const rect_comp_fid = env.*.GetStaticFieldID.?(env, r_cls, "Companion", "Lorg/jetbrains/skia/Rect$Companion;");
+                                                                    if (rect_comp_fid) |rcfid| {
+                                                                        const rect_comp = env.*.GetStaticObjectField.?(env, r_cls, rcfid);
+                                                                        if (rect_comp) |rc_obj| {
+                                                                            defer if (env.*.DeleteLocalRef) |del| del(env, rc_obj);
+                                                                            const rect_comp_cls = loadClass(env, loader, "org/jetbrains/skia/Rect$Companion");
+                                                                            if (rect_comp_cls) |rc_cls| {
+                                                                                defer if (env.*.DeleteLocalRef) |del| del(env, rc_cls);
+                                                                                const make_ltrb_mid = env.*.GetMethodID.?(env, rc_cls, "makeLTRB", "(FFFF)Lorg/jetbrains/skia/Rect;");
+                                                                                const make_wh_mid = env.*.GetMethodID.?(env, rc_cls, "makeWH", "(FF)Lorg/jetbrains/skia/Rect;");
+                                                                                if (make_ltrb_mid != null and make_wh_mid != null) {
+                                                                                    const src_rect = env.*.CallObjectMethod.?(env, rc_obj, make_ltrb_mid.?, @as(jfloat, @floatFromInt(min_x_padded)), @as(jfloat, @floatFromInt(min_y_padded)), @as(jfloat, @floatFromInt(max_x_padded)), @as(jfloat, @floatFromInt(max_y_padded)));
+                                                                                    defer if (src_rect != null and env.*.DeleteLocalRef != null) env.*.DeleteLocalRef.?(env, src_rect);
+                                                                                    const dst_rect = env.*.CallObjectMethod.?(env, rc_obj, make_wh_mid.?, @as(jfloat, @floatFromInt(crop_w)), @as(jfloat, @floatFromInt(crop_h)));
+                                                                                    defer if (dst_rect != null and env.*.DeleteLocalRef != null) env.*.DeleteLocalRef.?(env, dst_rect);
+
+                                                                                    const draw_mid = env.*.GetMethodID.?(env, cvs_cls, "drawImageRect", "(Lorg/jetbrains/skia/Image;Lorg/jetbrains/skia/Rect;Lorg/jetbrains/skia/Rect;)Lorg/jetbrains/skia/Canvas;");
+                                                                                    if (draw_mid) |dmid| {
+                                                                                        const cvs_ret = env.*.CallObjectMethod.?(env, cvs, dmid, full_img, src_rect, dst_rect);
+                                                                                        defer if (cvs_ret != null and env.*.DeleteLocalRef != null) env.*.DeleteLocalRef.?(env, cvs_ret);
+
+                                                                                        const make_snapshot_mid = env.*.GetMethodID.?(env, s_cls, "makeImageSnapshot", "()Lorg/jetbrains/skia/Image;");
+                                                                                        if (make_snapshot_mid) |msmid| {
+                                                                                            const snapshot = env.*.CallObjectMethod.?(env, surf, msmid);
+                                                                                            if (snapshot) |snap| {
+                                                                                                defer if (env.*.DeleteLocalRef) |del| del(env, snap);
+                                                                                                const data_obj = env.*.CallObjectMethod.?(env, snap, encode_mid, png_fmt, @as(jint, 100));
+                                                                                                if (data_obj) |dobj| {
+                                                                                                    defer if (env.*.DeleteLocalRef) |del| del(env, dobj);
+                                                                                                    final_bytes_obj = env.*.CallObjectMethod.?(env, dobj, get_bytes_mid);
+                                                                                                }
+                                                                                            }
+                                                                                        }
+                                                                                    }
+                                                                                }
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback: encode full image directly
+    if (final_bytes_obj == null) {
+        const data_obj = env.*.CallObjectMethod.?(env, full_img, encode_mid, png_fmt, @as(jint, 100));
+        if (data_obj) |dobj| {
+            defer if (env.*.DeleteLocalRef) |del| del(env, dobj);
+            final_bytes_obj = env.*.CallObjectMethod.?(env, dobj, get_bytes_mid);
+        }
+    }
+
+    if (final_bytes_obj == null) {
+        logErrFmt("[renderMessageItemToFile] Failed to encode PNG bytes", .{});
         return null;
     }
+    defer if (env.*.DeleteLocalRef) |del| del(env, final_bytes_obj);
+
+    const len = env.*.GetArrayLength.?(env, final_bytes_obj);
+    if (len <= 0) return null;
 
     const ulen: usize = @intCast(len);
     if (env.*.GetByteArrayRegion) |getRegion| {
         var stack_buf: [65536]i8 = undefined;
         if (ulen <= stack_buf.len) {
-            getRegion(env, jbarr, 0, len, &stack_buf);
+            getRegion(env, final_bytes_obj, 0, len, &stack_buf);
             const raw_ptr: [*]const u8 = @ptrCast(&stack_buf);
             return savePngBytesToFile(api, raw_ptr[0..ulen], out_path_buf);
         }
     }
 
     if (env.*.GetByteArrayElements) |getElements| {
-        const elements = getElements(env, jbarr, null);
+        const elements = getElements(env, final_bytes_obj, null);
         if (elements != null) {
-            defer if (env.*.ReleaseByteArrayElements) |rel| rel(env, jbarr, elements.?, 0);
+            defer if (env.*.ReleaseByteArrayElements) |rel| rel(env, final_bytes_obj, elements.?, 0);
             const raw_ptr: [*]const u8 = @ptrCast(elements.?);
             return savePngBytesToFile(api, raw_ptr[0..ulen], out_path_buf);
         }
@@ -1145,7 +1480,6 @@ pub export fn mandagram_plugin_unload() callconv(.c) void {
 
     quote_mutex.lock();
     cached_message_item = null;
-    bubble_renderer_class = null;
     pending_quote = .{};
     quote_mutex.unlock();
 }
