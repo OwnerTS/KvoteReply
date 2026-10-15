@@ -373,9 +373,20 @@ fn on_before_send_draft(param: *HookParam) callconv(.c) void {
     const get_long = api.get_long_field orelse return;
 
     const entry_obj = get_obj(this_obj, "entry") orelse return;
-    const reply_item = get_obj(entry_obj, "reply") orelse return;
-    const reply_id = get_long(reply_item, "id");
-    if (reply_id == 0) return;
+    const reply_item = get_obj(entry_obj, "reply");
+    if (reply_item == null) {
+        quote_mutex.lock();
+        pending_quote = .{};
+        quote_mutex.unlock();
+        return;
+    }
+    const reply_id = get_long(reply_item.?, "id");
+    if (reply_id == 0) {
+        quote_mutex.lock();
+        pending_quote = .{};
+        quote_mutex.unlock();
+        return;
+    }
 
     quote_mutex.lock();
     const need_render = (pending_quote.msg_id != reply_id or pending_quote.captured_path_len == 0);
@@ -387,133 +398,65 @@ fn on_before_send_draft(param: *HookParam) callconv(.c) void {
 }
 
 // -----------------------------------------------------------------------------
-// Перехватчики 3 и 4: Модификация исходящего TDLib запроса SendMessage
+// Перехватчик 3: Модификация исходящего сообщения (HookRegistry.filterOutgoingMessage)
 // -----------------------------------------------------------------------------
 
-fn handle_send_function(param: *HookParam, source_hook: [*:0]const u8, func_obj: jobject) void {
-    if (!is_active.load(.seq_cst)) return;
-    const api = global_api orelse return;
-    if (func_obj == null) return;
+var outgoing_json_buf: [16384]u8 = undefined;
 
-    const get_long = api.get_long_field orelse return;
-    const get_obj = api.get_object_field orelse return;
-    const get_str = api.get_string_utf orelse return;
-    const exec_query = api.execute_tdlib_query orelse return;
-
-    const chat_id = get_long(func_obj, "chatId");
-    if (chat_id == 0) return;
-
-    const reply_to = get_obj(func_obj, "replyTo") orelse return;
-    const msg_id = get_long(reply_to, "messageId");
-    if (msg_id == 0) return;
-
-    // Check discussion setting
-    quote_mutex.lock();
-    const is_disc = pending_quote.is_discussion;
-    quote_mutex.unlock();
-    if (disable_in_discussions and is_disc) return;
-
-    // Prevent double intercepting the same reply
-    if (last_intercepted_reply_id == msg_id) return;
-
-    // Check inputMessageContent: only transform text messages
-    const input_content = get_obj(func_obj, "inputMessageContent") orelse return;
-    const formatted_text = get_obj(input_content, "text") orelse return;
-
-    var user_caption_buf: [4096]u8 = undefined;
-    var user_caption_len: usize = 0;
-    if (get_obj(formatted_text, "text")) |jtext| {
-        const len = get_str(jtext, &user_caption_buf, user_caption_buf.len);
-        if (len > 0) user_caption_len = @intCast(len);
-    }
+fn on_before_send_message(
+    chat_id: i64,
+    text_ptr: [*:0]const u8,
+    user_data: usize,
+) callconv(.c) ?[*:0]const u8 {
+    _ = user_data;
+    if (!is_active.load(.seq_cst)) return text_ptr;
 
     quote_mutex.lock();
-    var photo_path_buf: [512]u8 = undefined;
-    var photo_path: ?[]const u8 = null;
+    defer quote_mutex.unlock();
 
-    if (pending_quote.msg_id == msg_id and pending_quote.captured_path_len > 0) {
-        const c_len = pending_quote.captured_path_len;
-        @memcpy(photo_path_buf[0..c_len], pending_quote.captured_path_buf[0..c_len]);
-        photo_path = photo_path_buf[0..c_len];
-    } else {
-        pending_quote.msg_id = msg_id;
-        if (preRenderQuote(api, &pending_quote)) |p| {
-            photo_path = p;
+    // Если нет активной цитаты или чат не совпадает — отправляем обычный текст
+    if (pending_quote.msg_id == 0) return text_ptr;
+    if (pending_quote.chat_id != 0 and pending_quote.chat_id != chat_id) return text_ptr;
+    if (disable_in_discussions and pending_quote.is_discussion) return text_ptr;
+
+    // Проверяем наличие отрендеренной фото-карточки
+    if (pending_quote.captured_path_len == 0) {
+        if (global_api) |api| {
+            if (preRenderQuote(api, &pending_quote)) |p| {
+                const copy_len = @min(p.len, pending_quote.captured_path_buf.len);
+                @memcpy(pending_quote.captured_path_buf[0..copy_len], p[0..copy_len]);
+                pending_quote.captured_path_len = copy_len;
+            }
         }
     }
 
-    var quote_text_buf: [4096]u8 = undefined;
-    const quote_text = pending_quote.text[0..pending_quote.text_len];
-    const quote_text_slice = if (quote_text.len > 0) quote_text else "💬 [Сообщение]";
-    const escaped_quote = escapeJson(quote_text_slice, &quote_text_buf);
-    quote_mutex.unlock();
+    if (pending_quote.captured_path_len == 0) return text_ptr;
 
-    const valid_photo_path = photo_path orelse {
-        logErrFmt("[{s}] Quote image not available for msg {d}", .{ source_hook, msg_id });
-        return;
-    };
+    const photo_path = pending_quote.captured_path_buf[0..pending_quote.captured_path_len];
+    const user_caption = std.mem.span(text_ptr);
 
     var escaped_caption_buf: [4096]u8 = undefined;
-    const escaped_caption = escapeJson(user_caption_buf[0..user_caption_len], &escaped_caption_buf);
+    const escaped_caption = escapeJson(user_caption, &escaped_caption_buf);
 
     var escaped_path_buf: [512]u8 = undefined;
-    const escaped_path = escapeJson(valid_photo_path, &escaped_path_buf);
+    const escaped_path = escapeJson(photo_path, &escaped_path_buf);
 
-    // Build TDLib sendMessage query with InputMessagePhoto and InputTextQuote
-    var json_buf: [16384]u8 = undefined;
-    const json_query = std.fmt.bufPrintZ(
-        &json_buf,
-        \\{{"@type":"sendMessage","chat_id":{d},"reply_to":{{"@type":"inputMessageReplyToMessage","message_id":{d},"quote":{{"@type":"inputTextQuote","text":{{"@type":"formattedText","text":"{s}","entities":[]}},"position":0}}}},"input_message_content":{{"@type":"inputMessagePhoto","photo":{{"@type":"inputFileLocal","path":"{s}"}},"caption":{{"@type":"formattedText","text":"{s}","entities":[]}}}}}}
+    const json = std.fmt.bufPrintZ(
+        &outgoing_json_buf,
+        \\{{"@type":"inputMessagePhoto","photo":{{"@type":"inputPhoto","photo":{{"@type":"inputFileLocal","path":"{s}"}}}},"caption":{{"@type":"formattedText","text":"{s}","entities":[]}}}}
     ,
         .{
-            chat_id,
-            msg_id,
-            escaped_quote,
             escaped_path,
             escaped_caption,
         },
-    ) catch {
-        logErrFmt("[{s}] JSON buffer overflow while building query", .{source_hook});
-        return;
-    };
+    ) catch return text_ptr;
 
-    // Cancel the original plain text SendMessage request
-    param.cancel();
-    last_intercepted_reply_id = msg_id;
+    logFmt("[send] Transformed outgoing reply into authentic photo quote card!", .{});
 
-    // Execute the transformed photo quote message query via TDLib
-    var out_buf: [8192]u8 = undefined;
-    const res_len = exec_query(json_query.ptr, &out_buf, out_buf.len);
-
-    if (res_len > 0) {
-        logFmt("[{s}] Success: Transformed outgoing reply into authentic photo quote card!", .{source_hook});
-    } else {
-        logErrFmt("[{s}] TDLib query execution returned code {d}", .{ source_hook, res_len });
-    }
-
-    quote_mutex.lock();
+    // Сбрасываем pending_quote после успешного захвата
     pending_quote = .{};
-    quote_mutex.unlock();
-}
 
-fn on_before_request_for_session(param: *HookParam) callconv(.c) void {
-    if (!is_active.load(.seq_cst)) return;
-    var i: usize = 0;
-    while (i < param.args_count) : (i += 1) {
-        if (param.args[i]) |arg| {
-            handle_send_function(param, "requestForSession", arg);
-        }
-    }
-}
-
-fn on_before_client_send(param: *HookParam) callconv(.c) void {
-    if (!is_active.load(.seq_cst)) return;
-    var i: usize = 0;
-    while (i < param.args_count) : (i += 1) {
-        if (param.args[i]) |arg| {
-            handle_send_function(param, "client.send", arg);
-        }
-    }
+    return json.ptr;
 }
 
 // -----------------------------------------------------------------------------
@@ -540,7 +483,7 @@ pub export fn mandagram_plugin_init(api: *const PluginApi) callconv(.c) bool {
 
     loadSettings(api);
 
-    // 1. Хук на выбор сообщения для ответа в UI
+    // 1. Хук на выбор сообщения для ответа в UI (фоновый пре-рендеринг карточки)
     _ = api.register_hook(
         "com/mandagram/ui/chat/ChatComposerActions",
         "beginReply",
@@ -558,25 +501,12 @@ pub export fn mandagram_plugin_init(api: *const PluginApi) callconv(.c) bool {
         null,
     );
 
-    // 3. Хук на отправку пакета запроса в сессии TDLib
-    _ = api.register_hook(
-        "com/mandagram/network/engine/TdLibSession",
-        "requestForSession",
-        null,
-        on_before_request_for_session,
-        null,
-    );
+    // 3. Хук исходящих сообщений через HookRegistry
+    if (api.register_message_send_hook) |reg_send| {
+        _ = reg_send(on_before_send_message, null, 0);
+    }
 
-    // 4. Запасной хук на прямой вызов клиента tdlight-java
-    _ = api.register_hook(
-        "it/tdlight/client/SimpleTelegramClient",
-        "send",
-        null,
-        on_before_client_send,
-        null,
-    );
-
-    // 5. Регистрация пункта в контекстном меню чата
+    // 4. Регистрация пункта в контекстном меню чата
     if (api.register_chat_action) |reg_action| {
         _ = reg_action("toggle_discussions", "KvoteReply: Toggle Discussion Quotes", on_toggle_setting_click, 0);
     }
