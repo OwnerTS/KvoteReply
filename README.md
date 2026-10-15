@@ -1,18 +1,20 @@
-# KvoteReply v1.0.0
+# KvoteReply v2.0.0
 
-Pixel-perfect authentic Compose message bubble photo quote replies for [MandaGram](https://github.com/OwnerTS/MandaGram).
+Authentic photo quote replies for [MandaGram](https://github.com/OwnerTS/MandaGram) built on MandaGram's modern pure FFI plugin architecture.
 
 ## Overview
 
-KvoteReply intercepts replies to Telegram messages and generates authentic quote cards directly from MandaGram's Compose UI components (`MessageBubble`, `MandaGramTheme`, Skia `ImageComposeScene`).
+KvoteReply intercepts replies to Telegram messages and generates beautiful, authentic photo quote cards directly inside the native plugin layer with zero JNI overhead.
 
-- **100% Pure Zig Native Architecture**: Zero Java bytecode files, zero `.class` files, zero JNI `DefineClass` calls, and zero C/C++ dependencies. The entire plugin is compiled into a single high-performance native dynamic library.
-- **Authentic Compose UI**: Directly invokes MandaGram's Compose components (`MessageBubbleKt.MessageBubble` wrapped in `ThemeKt.MandaGramTheme`). Retains the exact same Google Sans typography, Apple emoji, avatars, message shape, and verified badges.
-- **Headless & Offscreen**: Pure offscreen rendering via Jetpack Compose Desktop (`ImageComposeScene`) and Skia (`org.jetbrains.skia`). Zero OS window focus dependency, zero screen scraping, zero GDI+ approximations.
-- **Direct Skia Memory Scan**: Inspects raw pixel memory (`Pixmap.getAddr()`) with stride pitch awareness (`rowBytes`) to determine the exact bounding box of the message bubble with zero intermediate JVM byte array copying.
-- **Theme Matching**: Dynamically detects current MandaGram theme settings (Light, Dark, Monet Pistachio) and fills the bubble backdrop with the appropriate background color to prevent jarring white seams.
-- **JNI Safety & RAII**: Strict frame management using `PushLocalFrame` / `PopLocalFrame`, leak-free global reference cleanup on unload via cached `JavaVM`, and safe reference promotion.
-- **Cross-Platform**: Builds cleanly for Windows x64 (`.dll`) and Linux x86_64 (`.so`).
+- **100% Pure Zig Native Architecture**: Zero JNI dependencies (`JNIEnv`, `JavaVM`), zero Java bytecode manipulation, and zero C runtime dependencies. The entire plugin is compiled into a single high-performance native dynamic library.
+- **Pure FFI C-ABI Interop**: Seamlessly integrates with MandaGram's 53-slot `PluginApi` vtable and 40-byte `HookParam` layout (Project Panama FFM bridge).
+- **Built-in Software Rasterizer**: Pure Zig RGBA8888 canvas with alpha blending, rounded card corners, author avatar badge with initials, accent quote bar, and multiline word wrapping.
+- **Embedded Raster Typography**: Built-in 8x16 font supporting full ASCII (0x20..0x7E) and Russian Cyrillic (А-Я, а-я, Ё, ё, typographic quotes and dashes).
+- **Pure Zig PNG Encoder**: Built-in lossless PNG generator with uncompressed Deflate IDAT streams and hardware-accurate CRC32 and Adler32 checksums.
+- **Direct TDLib JSON Query Execution**: Cancels the default plain text send (`param.cancel()`) and dispatches `sendMessage` with `inputMessagePhoto` directly through `api.execute_tdlib_query`.
+- **Zero-Latency Background Pipeline**: Pre-renders the quote card in the background immediately when the user initiates a reply (`ChatComposerActions#beginReply`), so the card is ready before the user clicks Send.
+- **Settings & Action Menus**: Registers custom chat actions via `api.register_chat_action` and persists state via `api.get_storage_dir`.
+- **Cross-Platform**: Compiles out-of-the-box for Windows x64 (`quoteReply.dll`) and Linux x86_64 (`libquoteReply.so`).
 
 ## Architecture & Pipeline
 
@@ -22,26 +24,41 @@ Telegram UI (AWT Thread)
        ▼
 ChatComposerActions#beginReply (Hook 1)
        │
-       ├──► Asynchronous Headless Pre-rendering
-       │       ├── ImageComposeScene (650x1500)
-       │       ├── ComposeInterop.createComposableLambda
-       │       ├── MandaGramTheme { MessageBubble(...) }
-       │       └── Skia Image Snapshot
-       │               │
-       │               ├── Native Memory Scan (Pixmap.getAddr)
-       │               ├── Find Non-Empty Alpha Bounding Box
-       │               ├── Sub-surface Blit with Background Fill
-       │               └── Lossless PNG Encode to Disk Cache
+       ├──► Parse replied message ID, sender title, and text via FFI reflection
+       ├──► Asynchronous background render to cache (<cache_dir>/quote_replies/quote_reply_<id>.png)
+       │       ├── RGBA8888 canvas allocation
+       │       ├── Backdrop, rounded bubble, avatar circle, and accent line
+       │       ├── 8x16 bitmap typography (ASCII + Cyrillic)
+       │       └── Pure Zig PNG encoding (IHDR, IDAT, IEND)
        │
 ChatComposerActions#sendDraft (Hook 2)
        │
        ▼
 TdLibSession#requestForSession / SimpleTelegramClient#send (Hooks 3 & 4)
        │
-       ├──► Intercept it.tdlight.jni.TdApi$SendMessage
-       ├──► Replace InputMessageText with InputMessagePhoto (using rendered PNG)
-       ├──► Attach original message text as caption
-       └──► Attach Telegram InputTextQuote metadata to replyTo
+       ├──► Intercept outgoing reply
+       ├──► Check if quote PNG is ready
+       ├──► Cancel default send: param.cancel()
+       └──► Execute TDLib JSON via api.execute_tdlib_query:
+               {
+                 "@type": "sendMessage",
+                 "chat_id": <chat_id>,
+                 "reply_to": {
+                   "@type": "inputMessageReplyToMessage",
+                   "message_id": <reply_msg_id>
+                 },
+                 "input_message_content": {
+                   "@type": "inputMessagePhoto",
+                   "photo": {
+                     "@type": "inputFileLocal",
+                     "path": "<quote_png_path>"
+                   },
+                   "caption": {
+                     "@type": "formattedText",
+                     "text": "<outgoing_text>"
+                   }
+                 }
+               }
 ```
 
 ## Building
@@ -52,17 +69,19 @@ Requires [Zig](https://ziglang.org/) **0.15.2+**.
 # Run unit tests
 zig build test --summary all
 
-# Build for host OS
+# Build for host OS (Windows x64 or Linux x86_64)
 zig build -Doptimize=ReleaseFast
 
-# Cross-compile for Windows x64
+# Cross-compile for Windows x64 (from Linux or Windows)
 zig build -Doptimize=ReleaseFast -Dtarget=x86_64-windows-gnu
 
-# Cross-compile for Linux x86_64
+# Cross-compile for Linux x86_64 (from Windows or Linux)
 zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux-gnu
 ```
 
-The compiled binaries will be in `zig-out/bin/` (Windows `.dll`) or `zig-out/lib/` (Linux `.so`).
+The compiled binaries will be placed in:
+- Windows: `zig-out/bin/quoteReply.dll`
+- Linux: `zig-out/lib/libquoteReply.so`
 
 ## Installation
 
@@ -71,6 +90,22 @@ The compiled binaries will be in `zig-out/bin/` (Windows `.dll`) or `zig-out/lib
    <MandaGram>/data/plugins/
    ```
 2. Enable or reload the plugin in MandaGram settings.
+
+## Unit Tests
+
+The test suite validates:
+- UTF-8 string truncation and bounds validation
+- JSON character escaping (quotes, backslashes, control characters)
+- Plugin metadata structure and hooks table
+- Quote cache path generation and rotation logic
+- Font glyph rendering and ASCII/Cyrillic character mapping
+- PNG signature, chunks, CRC32, and Adler32 checksums
+- Full quote card rendering and PNG encoding pipeline
+
+Run tests with:
+```bash
+zig build test --summary all
+```
 
 ## License
 

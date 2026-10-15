@@ -1,6 +1,8 @@
 const std = @import("std");
 const testing = std.testing;
 const plugin = @import("plugin.zig");
+const renderer = @import("renderer.zig");
+const font = @import("font.zig");
 
 test "utf8Truncate ascii" {
     const text = "Hello world!";
@@ -39,11 +41,18 @@ test "utf8Truncate 4-byte emoji boundary" {
     try testing.expectEqualStrings("A🔥", res5);
 }
 
+test "escapeJson handles quotes, slashes, and control characters" {
+    const input = "Hello \"World\"\nLine 2\\Path\tTab";
+    var out_buf: [256]u8 = undefined;
+    const escaped = plugin.escapeJson(input, &out_buf);
+    try testing.expectEqualStrings("Hello \\\"World\\\"\\nLine 2\\\\Path\\tTab", escaped);
+}
+
 test "plugin metadata" {
     const meta = plugin.mandagram_plugin_metadata();
     try testing.expect(meta != null);
     try testing.expectEqualStrings("KvoteReply", std.mem.span(meta.?.name));
-    try testing.expectEqualStrings("1.0.0", std.mem.span(meta.?.version));
+    try testing.expectEqualStrings("2.0.0", std.mem.span(meta.?.version));
     try testing.expectEqualStrings("OwnerTS", std.mem.span(meta.?.author));
 }
 
@@ -79,4 +88,52 @@ test "cleanupCacheDir rotates old quote files" {
         }
     }
     try testing.expectEqual(@as(usize, 3), count);
+}
+
+test "font module provides valid glyphs for ascii and cyrillic" {
+    const glyph_a = font.getGlyph('A');
+    var sum_a: u32 = 0;
+    for (glyph_a) |b| sum_a += b;
+    try testing.expect(sum_a > 0);
+
+    const glyph_cyr_b = font.getGlyph(0x0411); // 'Б'
+    var sum_b: u32 = 0;
+    for (glyph_cyr_b) |b| sum_b += b;
+    try testing.expect(sum_b > 0);
+}
+
+test "png encoder produces valid PNG structure" {
+    const width = 64;
+    const height = 32;
+    var pixels: [width * height]u32 = undefined;
+    @memset(&pixels, 0xFF00FF00); // Green
+
+    const png_bytes = try renderer.encodePng(testing.allocator, width, height, &pixels);
+    defer testing.allocator.free(png_bytes);
+
+    // PNG signature
+    try testing.expect(png_bytes.len > 64);
+    try testing.expectEqualStrings("\x89PNG\r\n\x1a\n", png_bytes[0..8]);
+
+    // IHDR chunk
+    try testing.expectEqualStrings("IHDR", png_bytes[12..16]);
+
+    // IEND chunk at end
+    const end_offset = png_bytes.len - 12;
+    try testing.expectEqualStrings("IEND", png_bytes[end_offset + 4 .. end_offset + 8]);
+}
+
+test "renderQuoteCard produces valid card PNG" {
+    const png_data = try renderer.renderQuoteCard(
+        testing.allocator,
+        "Pavel Durov",
+        "Telegram is fast and secure. Here is an authentic quote reply!",
+        "19:42",
+        "PD",
+        false,
+    );
+    defer testing.allocator.free(png_data);
+
+    try testing.expect(png_data.len > 1000);
+    try testing.expectEqualStrings("\x89PNG\r\n\x1a\n", png_data[0..8]);
 }
