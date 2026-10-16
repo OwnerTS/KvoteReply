@@ -17,19 +17,22 @@
 
 const std = @import("std");
 const plugin_api = @import("include/mandagram_plugin.zig");
+const jvm = @import("jvm_render.zig");
 
-// Импорт базовых типов JNI и Plugin API
+// FFI Plugin API типы
 const HookParam = plugin_api.HookParam;
 const PluginApi = plugin_api.PluginApi;
-const JNIEnv = plugin_api.JNIEnv;
-const JavaVM = plugin_api.JavaVM;
 const jobject = plugin_api.jobject;
-const jclass = plugin_api.jclass;
-const jvalue = plugin_api.jvalue;
-const jint = plugin_api.jint;
-const jlong = plugin_api.jlong;
-const jboolean = plugin_api.jboolean;
-const jfloat = plugin_api.jfloat;
+
+// Приватные типы рантайма для offscreen Compose/Skia сцены
+const JNIEnv = jvm.JNIEnv;
+const JavaVM = jvm.JavaVM;
+const jclass = jvm.jclass;
+const jvalue = jvm.jvalue;
+const jint = jvm.jint;
+const jlong = jvm.jlong;
+const jboolean = jvm.jboolean;
+const jfloat = jvm.jfloat;
 
 // -----------------------------------------------------------------------------
 // Глобальное состояние плагина
@@ -327,8 +330,8 @@ fn getClassLoaderFromObject(env: *JNIEnv, obj: jobject) jobject {
 }
 
 fn loadClass(env: *JNIEnv, loader: ?jobject, name_slashed: [*:0]const u8) ?jclass {
-    const ldr = loader orelse plugin_api.getAppClassLoader(env);
-    return plugin_api.loadClassWithLoader(env, ldr, name_slashed);
+    const ldr = loader orelse jvm.getAppClassLoader(env);
+    return jvm.loadClassWithLoader(env, ldr, name_slashed);
 }
 
 // -----------------------------------------------------------------------------
@@ -582,8 +585,8 @@ const RenderState = struct {
 };
 
 fn renderComposable(composer_seg: jobject, user_data: usize) callconv(.c) void {
-    const env = plugin_api.getJniEnv() orelse return;
-    const real_composer = plugin_api.toJniObject(env, composer_seg);
+    const env = jvm.getJniEnv() orelse return;
+    const real_composer = jvm.toJniObject(env, composer_seg);
     if (real_composer == null) return;
 
     const state: *RenderState = @ptrFromInt(user_data);
@@ -937,10 +940,10 @@ fn renderMessageItemToFile(env: *JNIEnv, msg_item: jobject, out_path_buf: []u8) 
 
 fn on_before_begin_reply(param: *HookParam) callconv(.c) void {
     if (!is_active.load(.seq_cst)) return;
-    const env = param.getEnv() orelse return;
+    const env = jvm.getJniEnv() orelse return;
 
     const raw_item = param.args[0] orelse return;
-    const msg_item = plugin_api.toJniObject(env, raw_item);
+    const msg_item = jvm.toJniObject(env, raw_item);
     if (msg_item == null) {
         logErrFmt("[beginReply] toJniObject returned null for raw_item", .{});
         return;
@@ -990,10 +993,10 @@ fn on_before_begin_reply(param: *HookParam) callconv(.c) void {
 
 fn on_before_send_draft(param: *HookParam) callconv(.c) void {
     if (!is_active.load(.seq_cst)) return;
-    const env = param.getEnv() orelse return;
+    const env = jvm.getJniEnv() orelse return;
 
     const raw_this = param.this_ptr orelse return;
-    const this_obj = plugin_api.toJniObject(env, raw_this);
+    const this_obj = jvm.toJniObject(env, raw_this);
     if (this_obj == null) {
         logErrFmt("[sendDraft] toJniObject returned null for this_obj", .{});
         return;
@@ -1099,7 +1102,7 @@ fn on_before_send_message(
 
     // Проверяем наличие отрендеренной фото-карточки
     if (pending_quote.captured_path_len == 0 and cached_message_item != null) {
-        const env = plugin_api.getJniEnv();
+        const env = jvm.getJniEnv();
         if (env) |e| {
             var render_buf: [512]u8 = undefined;
             if (renderMessageItemToFile(e, cached_message_item.?, &render_buf)) |p| {
@@ -1137,7 +1140,7 @@ fn on_before_send_message(
     // Очищаем состояние после захвата
     pending_quote = .{};
     if (cached_message_item) |gref| {
-        const env = plugin_api.getJniEnv();
+        const env = jvm.getJniEnv();
         if (env) |e| {
             if (e.*.DeleteGlobalRef) |del| del(e, gref);
         }
@@ -1171,9 +1174,9 @@ pub export fn mandagram_plugin_init(api: *const PluginApi) callconv(.c) bool {
 
     loadSettings(api);
 
-    const env = plugin_api.getJniEnv();
+    const env = jvm.getJniEnv();
     if (env) |e| {
-        _ = plugin_api.getAppClassLoader(e);
+        _ = jvm.getAppClassLoader(e);
     }
 
     // 1. Хук на выбор сообщения для ответа в UI (фоновый пре-рендеринг карточки)
@@ -1217,7 +1220,7 @@ pub export fn mandagram_plugin_unload() callconv(.c) void {
     quote_mutex.lock();
     pending_quote = .{};
     if (cached_message_item) |gref| {
-        const env = plugin_api.getJniEnv();
+        const env = jvm.getJniEnv();
         if (env) |e| {
             if (e.*.DeleteGlobalRef) |del| del(e, gref);
         }
