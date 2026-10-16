@@ -17,12 +17,10 @@
 
 const std = @import("std");
 const plugin_api = @import("include/mandagram_plugin.zig");
-const accessor = @import("include/jni_accessor.zig");
 
 // Импорт базовых типов JNI и Plugin API
 const HookParam = plugin_api.HookParam;
 const PluginApi = plugin_api.PluginApi;
-const JniAccessor = accessor.JniAccessor;
 const JNIEnv = plugin_api.JNIEnv;
 const JavaVM = plugin_api.JavaVM;
 const jobject = plugin_api.jobject;
@@ -310,20 +308,22 @@ pub fn savePngBytesToFile(
 
 fn getClassLoaderFromObject(env: *JNIEnv, obj: jobject) jobject {
     if (obj == null) return null;
-    const item_cls = JniAccessor.getObjectClass(env, obj) orelse return null;
-    defer if (env.*.DeleteLocalRef) |del| del(env, item_cls);
-    const cls_cls = JniAccessor.getObjectClass(env, item_cls) orelse return null;
-    defer if (env.*.DeleteLocalRef) |del| del(env, cls_cls);
+    const item_cls = if (env.*.GetObjectClass) |f| f(env, obj) else null;
+    if (item_cls == null) return null;
+    defer if (env.*.DeleteLocalRef) |del| del(env, item_cls.?);
+    const cls_cls = if (env.*.GetObjectClass) |f| f(env, item_cls.?) else null;
+    if (cls_cls == null) return null;
+    defer if (env.*.DeleteLocalRef) |del| del(env, cls_cls.?);
     const mid = env.*.GetMethodID.?(
         env,
-        cls_cls,
+        cls_cls.?,
         "getClassLoader",
         "()Ljava/lang/ClassLoader;",
     ) orelse {
         checkClearException(env);
         return null;
     };
-    return env.*.CallObjectMethod.?(env, item_cls, mid);
+    return env.*.CallObjectMethod.?(env, item_cls.?, mid);
 }
 
 fn loadClass(env: *JNIEnv, loader: ?jobject, name_slashed: [*:0]const u8) ?jclass {
@@ -458,7 +458,7 @@ fn encodeImageToPngBytes(env: *JNIEnv, loader: jobject, image: jobject, quality:
 }
 
 pub fn getChatBackgroundColor(env: *JNIEnv) i32 {
-    const theme_mgr_cls = JniAccessor.findClass(env, "com/mandagram/ui/theme/ThemeManager") orelse return @bitCast(@as(u32, 0xFF100D0B));
+    const theme_mgr_cls = loadClass(env, null, "com/mandagram/ui/theme/ThemeManager") orelse return @bitCast(@as(u32, 0xFF100D0B));
     defer if (env.*.DeleteLocalRef) |del| del(env, theme_mgr_cls);
 
     const inst_fid = env.*.GetStaticFieldID.?(
@@ -499,7 +499,7 @@ pub fn getChatBackgroundColor(env: *JNIEnv) i32 {
     if (seed_mid) |smid| {
         const seed = env.*.CallLongMethod.?(env, inst.?, smid);
         checkClearException(env);
-        const monet_cls = JniAccessor.findClass(env, "com/mandagram/ui/theme/MonetSeed");
+        const monet_cls = loadClass(env, null, "com/mandagram/ui/theme/MonetSeed");
         if (monet_cls) |mcls| {
             defer if (env.*.DeleteLocalRef) |del| del(env, mcls);
             const pist_fid = env.*.GetStaticFieldID.?(env, mcls, "PISTACHIO", "Lcom/mandagram/ui/theme/MonetSeed;");
@@ -668,11 +668,13 @@ fn renderMessageItemToFile(env: *JNIEnv, msg_item: jobject, out_path_buf: []u8) 
         if (env.*.DeleteLocalRef) |del| del(env, loader.?);
     };
 
-    const item_cls = JniAccessor.getObjectClass(env, msg_item) orelse return null;
-    const is_outgoing_mid = env.*.GetMethodID.?(env, item_cls, "isOutgoing", "()Z") orelse return null;
+    const item_cls = if (env.*.GetObjectClass) |f| f(env, msg_item) else null;
+    if (item_cls == null) return null;
+    defer if (env.*.DeleteLocalRef) |del| del(env, item_cls.?);
+    const is_outgoing_mid = env.*.GetMethodID.?(env, item_cls.?, "isOutgoing", "()Z") orelse return null;
     const is_outgoing = env.*.CallBooleanMethod.?(env, msg_item, is_outgoing_mid) != 0;
 
-    const is_channel_mid = env.*.GetMethodID.?(env, item_cls, "isChannelPost", "()Z") orelse return null;
+    const is_channel_mid = env.*.GetMethodID.?(env, item_cls.?, "isChannelPost", "()Z") orelse return null;
     const is_channel = env.*.CallBooleanMethod.?(env, msg_item, is_channel_mid) != 0;
 
     var state = RenderState{
@@ -944,10 +946,11 @@ fn on_before_begin_reply(param: *HookParam) callconv(.c) void {
         return;
     }
 
-    const item_cls = JniAccessor.getObjectClass(env, msg_item) orelse return;
-    defer if (env.*.DeleteLocalRef) |del| del(env, item_cls);
+    const item_cls = if (env.*.GetObjectClass) |f| f(env, msg_item) else null;
+    if (item_cls == null) return;
+    defer if (env.*.DeleteLocalRef) |del| del(env, item_cls.?);
 
-    const get_id_mid = env.*.GetMethodID.?(env, item_cls, "getId", "()J") orelse return;
+    const get_id_mid = env.*.GetMethodID.?(env, item_cls.?, "getId", "()J") orelse return;
     const msg_id = env.*.CallLongMethod.?(env, msg_item, get_id_mid);
     if (msg_id == 0) return;
 
@@ -996,12 +999,13 @@ fn on_before_send_draft(param: *HookParam) callconv(.c) void {
         return;
     }
 
-    const actions_cls = JniAccessor.getObjectClass(env, this_obj) orelse return;
-    defer if (env.*.DeleteLocalRef) |del| del(env, actions_cls);
+    const actions_cls = if (env.*.GetObjectClass) |f| f(env, this_obj) else null;
+    if (actions_cls == null) return;
+    defer if (env.*.DeleteLocalRef) |del| del(env, actions_cls.?);
 
     const entry_fid = env.*.GetFieldID.?(
         env,
-        actions_cls,
+        actions_cls.?,
         "entry",
         "Lcom/mandagram/ui/chat/ComposerDraftEntry;",
     ) orelse {
@@ -1016,13 +1020,14 @@ fn on_before_send_draft(param: *HookParam) callconv(.c) void {
     }
     defer if (env.*.DeleteLocalRef) |del| del(env, entry_obj.?);
 
-    const entry_cls = JniAccessor.getObjectClass(env, entry_obj.?) orelse return;
-    defer if (env.*.DeleteLocalRef) |del| del(env, entry_cls);
+    const entry_cls = if (env.*.GetObjectClass) |f| f(env, entry_obj.?) else null;
+    if (entry_cls == null) return;
+    defer if (env.*.DeleteLocalRef) |del| del(env, entry_cls.?);
 
     // Вызываем Kotlin getter `getReply()` для проверки активного ответа
     const reply_mid = env.*.GetMethodID.?(
         env,
-        entry_cls,
+        entry_cls.?,
         "getReply",
         "()Lcom/mandagram/models/MessageItem;",
     ) orelse {
@@ -1044,10 +1049,11 @@ fn on_before_send_draft(param: *HookParam) callconv(.c) void {
     }
     defer if (env.*.DeleteLocalRef) |del| del(env, reply_item.?);
 
-    const reply_cls = JniAccessor.getObjectClass(env, reply_item.?) orelse return;
-    defer if (env.*.DeleteLocalRef) |del| del(env, reply_cls);
+    const reply_cls = if (env.*.GetObjectClass) |f| f(env, reply_item.?) else null;
+    if (reply_cls == null) return;
+    defer if (env.*.DeleteLocalRef) |del| del(env, reply_cls.?);
 
-    const get_id_mid = env.*.GetMethodID.?(env, reply_cls, "getId", "()J") orelse return;
+    const get_id_mid = env.*.GetMethodID.?(env, reply_cls.?, "getId", "()J") orelse return;
     const reply_id = env.*.CallLongMethod.?(env, reply_item.?, get_id_mid);
 
     quote_mutex.lock();
