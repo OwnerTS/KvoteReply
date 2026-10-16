@@ -1281,7 +1281,7 @@ fn on_before_send_message(
 
     const json = std.fmt.bufPrintZ(
         &outgoing_json_buf,
-        \\{{"@type":"inputMessagePhoto","photo":{{"@type":"inputFileLocal","path":"{s}"}},"caption":{{"@type":"formattedText","text":"{s}","entities":[]}}}}
+        \\{{"@type":"inputMessagePhoto","photo":{{"@type":"inputPhoto","photo":{{"@type":"inputFileLocal","path":"{s}"}}}},"caption":{{"@type":"formattedText","text":"{s}","entities":[]}}}}
     ,
         .{
             escaped_path,
